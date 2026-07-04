@@ -1,0 +1,10 @@
+# build artifacts
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# never commit sessions/cookies
+cookies_*.txt
+.yt_webview_profile/
