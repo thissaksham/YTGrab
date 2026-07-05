@@ -1534,6 +1534,8 @@ def bootstrap(api):
 
 
 def main():
+    if "--ping" in sys.argv:   # boot-cost probe: exits before any window
+        sys.exit(0)
     APP_DIR.mkdir(parents=True, exist_ok=True)
     if "--setup" in sys.argv:
         ok = ensure_deps(log)
