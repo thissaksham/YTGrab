@@ -1,21 +1,23 @@
 """YTGrab — single-exe yt-dlp UI for Windows.
 
 WebView2 (ships with Windows 11) renders the UI and hosts the captive
-YouTube login. No cookie file is kept: mark-watched fires YouTube's own
-stats ping as page JS inside the logged-in profile, and login state is
-read from the page itself. Downloads run anonymous; only if YouTube
-bot-checks does the app hand the session to yt-dlp via a temp file that
-is zeroed and deleted the moment that download ends.
-All app data lives in %LOCALAPPDATA%\\YTGrab\\ (bin, profile, config).
+login. YouTube downloads run ANONYMOUS on purpose: passing the account
+session makes YouTube serve SABR-only streams that yield 0 downloadable
+formats (verified), while anonymous gives the full format list. Login is
+used for mark-watched (browser stat pings, no cookies to yt-dlp) and for
+non-YouTube sites, whose session is handed to yt-dlp via a temp file that
+is zeroed and deleted the moment the run ends.
+All app data lives in %LOCALAPPDATA%\\YTGrab\\ (bin, profile, config, history).
 
   ytgrab.py            launch the UI
   ytgrab.py --setup    CLI: download/update yt-dlp + ffmpeg, then exit
 
-Build: pyinstaller --onefile --windowed --name YTGrab ytgrab.py
+Build: pyinstaller --onefile --windowed --name YTGrab --icon ytgrab.ico ytgrab.py
 """
 import ctypes
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -37,6 +39,7 @@ APP_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
 BIN_DIR = APP_DIR / "bin"
 PROFILE_DIR = APP_DIR / "profile"
 CONFIG_FILE = APP_DIR / "config.json"
+HISTORY_FILE = APP_DIR / "history.json"
 LOG_FILE = APP_DIR / "ytgrab.log"
 YTDLP = BIN_DIR / "yt-dlp.exe"
 FFMPEG = BIN_DIR / "ffmpeg.exe"
@@ -55,19 +58,16 @@ DEFAULT_FORMAT = ("bv*[vcodec~=vp9][height>=720][height<=1080]+ba[acodec~=opus]"
 BASE_OPTS = ["--no-warnings", "--embed-metadata", "--embed-thumbnail",
              "--convert-thumbnails", "jpg", "--write-info-json", "--retries", "3",
              "--progress", "--newline", "--merge-output-format", "mp4"]
-VIDEO_EXTS = {".webm", ".mp4", ".mkv", ".avi", ".mov", ".flv", ".m4v"}
+VIDEO_EXTS = {".webm", ".mp4", ".mkv", ".avi", ".mov", ".flv", ".m4v", ".m4a", ".mp3", ".opus"}
 NO_WINDOW = 0x08000000
 UI_WIN = None
 
-# yt-dlp output → structured queue events
+# yt-dlp output -> structured queue events
 RE_YT_ID = re.compile(r"^\[youtube\] ([A-Za-z0-9_-]{11}): Downloading webpage")
 RE_DEST = re.compile(r"^\[download\] Destination: (.+)$")
 RE_PROG = re.compile(r"^\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*\S+"
                      r"(?:\s+at\s+(\S+))?(?:\s+ETA\s+(\S+))?")
 RE_FILE_ID = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
-POST_PREFIXES = ("[Merger]", "[Metadata]", "[EmbedThumbnail]",
-                 "[ThumbnailsConvertor]", "[ExtractAudio]", "[VideoConvertor]",
-                 "[Fixup")
 
 
 def log(msg):
@@ -81,27 +81,60 @@ def log(msg):
         print(line)
 
 
-# === config ===
+# === config / history ===
+
+def _load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
 
 def load_config():
-    try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    d = _load_json(CONFIG_FILE, {})
+    return d if isinstance(d, dict) else {}
 
 
 def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
-# === captive-profile helpers (no cookie ever leaves the browser) ===
+def load_history():
+    d = _load_json(HISTORY_FILE, [])
+    return d if isinstance(d, list) else []
+
+
+def save_history(h):
+    try:
+        HISTORY_FILE.write_text(json.dumps(h, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def human_size(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# === captive-profile helpers (no cookie ever persists to disk) ===
 
 JS_LOGGED_IN = ("(function(){try{if(!(window.ytcfg&&ytcfg.get))return -1;"
                 "return ytcfg.get('LOGGED_IN')?1:0}catch(e){return -1}})()")
 # Same endpoints yt-dlp's --mark-watched hits, fired as page JS inside the
 # logged-in profile so credentials never leave the browser. The playback ping
 # creates the history entry; the watchtime ping (st/et = full length) records
-# 100% watch progress — verified via startPercent:100 in the history feed.
+# 100% watch progress -- verified via startPercent:100 in the history feed.
 JS_MARK_WATCHED = (
     "(function(){try{"
     "var pr=window.ytInitialPlayerResponse;"
@@ -127,8 +160,7 @@ JS_MARK_WATCHED = (
 
 def _hidden_poll(url, js, accept, timeout, grace=0):
     """Open url hidden in the captive profile, poll js until accept(result)
-    or timeout; return the accepted result (or None). grace: seconds to keep
-    the page alive after success (lets in-flight requests leave)."""
+    or timeout; return the accepted result (or None)."""
     w = webview.create_window("ytgrab-worker", url, hidden=True)
     closed = threading.Event()
     w.events.closed += lambda *a: closed.set()
@@ -153,16 +185,8 @@ def _hidden_poll(url, js, accept, timeout, grace=0):
     return hit
 
 
-def check_login():
-    """True if the captive profile is signed into YouTube."""
-    r = _hidden_poll("https://www.youtube.com", JS_LOGGED_IN,
-                     lambda r: r in (0, 1), 30)
-    return r == 1
-
-
 def browser_mark_watched(url, push):
-    """Fire the videostats ping from the logged-in profile (verified to
-    create a real history entry)."""
+    """Fire the videostats ping from the logged-in profile."""
     r = _hidden_poll(url, JS_MARK_WATCHED, lambda r: r == 1, 45, grace=4)
     ok = r == 1
     push("[post] marked as watched" if ok else "[post] mark-watched failed")
@@ -179,30 +203,7 @@ def site_key(url):
     return host, (parts[-2] if len(parts) >= 2 else host)
 
 
-def profile_session_jar(origin="https://www.youtube.com", require="youtube"):
-    """Dump the profile's cookies for a site to an in-memory Netscape string.
-    Used transiently: the caller writes it to a temp file for one yt-dlp run
-    and destroys it right after. Never persisted."""
-    w = webview.create_window("ytgrab-worker", origin, hidden=True)
-    closed = threading.Event()
-    w.events.closed += lambda *a: closed.set()
-    jars = None
-    deadline = time.time() + 25
-    while not closed.is_set() and time.time() < deadline:
-        time.sleep(2)
-        try:
-            got = w.get_cookies()
-        except Exception:
-            got = None
-        if got and (not require or
-                    any(require in (m["domain"] or "") for j in got for m in j.values())):
-            jars = got
-            break
-    if not closed.is_set():
-        try:
-            w.destroy()
-        except Exception:
-            pass
+def jars_to_netscape(jars, origin):
     if not jars:
         return None
     fallback = "." + (urlparse(origin).hostname or "")
@@ -226,6 +227,66 @@ def profile_session_jar(origin="https://www.youtube.com", require="youtube"):
                                     "TRUE" if m["secure"] else "FALSE",
                                     str(epoch), name, m.value]))
     return "\n".join(lines) + "\n"
+
+
+def probe_youtube(timeout=30):
+    """One hidden window -> (logged_in: bool, jar_text: str|None). Warms both
+    the login badge and the session cache in a single pass."""
+    w = webview.create_window("ytgrab-worker", "https://www.youtube.com", hidden=True)
+    closed = threading.Event()
+    w.events.closed += lambda *a: closed.set()
+    logged, jars = None, None
+    deadline = time.time() + timeout
+    while not closed.is_set() and time.time() < deadline:
+        time.sleep(2)
+        if logged is None:
+            try:
+                r = w.evaluate_js(JS_LOGGED_IN)
+            except Exception:
+                r = None
+            if r in (0, 1):
+                logged = (r == 1)
+        if jars is None:
+            try:
+                got = w.get_cookies()
+            except Exception:
+                got = None
+            if got and any("youtube" in (m["domain"] or "")
+                           for j in got for m in j.values()):
+                jars = got
+        if logged is not None and (jars is not None or logged is False):
+            break
+    if not closed.is_set():
+        try:
+            w.destroy()
+        except Exception:
+            pass
+    return bool(logged), jars_to_netscape(jars, "https://www.youtube.com")
+
+
+def profile_session_jar(origin="https://www.youtube.com", require="youtube"):
+    """Netscape cookie text for a site's session from the profile, or None."""
+    w = webview.create_window("ytgrab-worker", origin, hidden=True)
+    closed = threading.Event()
+    w.events.closed += lambda *a: closed.set()
+    jars = None
+    deadline = time.time() + 25
+    while not closed.is_set() and time.time() < deadline:
+        time.sleep(2)
+        try:
+            got = w.get_cookies()
+        except Exception:
+            got = None
+        if got and (not require or
+                    any(require in (m["domain"] or "") for j in got for m in j.values())):
+            jars = got
+            break
+    if not closed.is_set():
+        try:
+            w.destroy()
+        except Exception:
+            pass
+    return jars_to_netscape(jars, origin)
 
 
 # === file times (mtime + Windows creation time) ===
@@ -363,49 +424,113 @@ def epoch_from_info(info):
     return None
 
 
+def fmt_label(info, path):
+    ext = (path.suffix.lstrip(".").lower() if path else info.get("ext") or "")
+    h = info.get("height")
+    if h:
+        return f"{h}p {ext}".strip()
+    if info.get("acodec") and info.get("acodec") != "none" and not info.get("height"):
+        abr = info.get("abr")
+        return (f"{int(abr)}kbps " if abr else "audio ") + ext
+    return info.get("format_note") or ext or "?"
+
+
+def build_entry(info, target, vid):
+    thumb = (f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+             if len(vid) == 11 else (info.get("thumbnail") or ""))
+    size = target.stat().st_size
+    return {
+        "id": vid or target.stem,
+        "title": info.get("title") or target.stem,
+        "channel": info.get("uploader") or info.get("channel") or "",
+        "duration": fmt_dur(info["duration"]) if info.get("duration") else "",
+        "format": fmt_label(info, target),
+        "size": size, "size_h": human_size(size),
+        "thumb": thumb, "path": str(target), "ts": time.time(),
+    }
+
+
 def postprocess(dl_dir, started, api, mark=True, stamp=True):
-    """For each fresh .info.json: optionally stamp the video file with its
-    upload date and mark it watched, then delete the json."""
+    """For each fresh .info.json: optionally stamp the file date and mark it
+    watched (with live phase updates), record a history entry, delete the json.
+    Returns the list of history entries built."""
     push = api._push
-    for jf in Path(dl_dir).glob("*.info.json"):
+    entries = []
+    for jf in sorted(Path(dl_dir).glob("*.info.json"), key=lambda p: p.stat().st_mtime):
         try:
             if jf.stat().st_mtime < started - 5:
                 continue
             info = json.loads(jf.read_text(encoding="utf-8"))
             vid = info.get("id", "")
-            if stamp:
-                cands = [p for p in Path(dl_dir).iterdir()
-                         if p.suffix.lower() in VIDEO_EXTS and vid and vid in p.name]
-                if cands:
-                    target = max(cands, key=lambda p: p.stat().st_mtime)
-                    epoch = epoch_from_info(info)
-                    if epoch:
-                        set_file_times(target, epoch)
-                        push(f"[post] timestamp set: {target.name}")
+            cands = [p for p in Path(dl_dir).iterdir()
+                     if p.suffix.lower() in VIDEO_EXTS and vid and vid in p.name]
+            target = max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+            if target and stamp:
+                api._item(key=vid, status="processing", phase="Setting date")
+                epoch = epoch_from_info(info)
+                if epoch:
+                    set_file_times(target, epoch)
+                    push(f"[post] timestamp set: {target.name}")
             url = info.get("webpage_url", "")
             if mark and "youtube" in url and api.logged_in:
+                api._item(key=vid, status="processing", phase="Marking watched")
                 browser_mark_watched(url, push)
+            if target:
+                entries.append(build_entry(info, target, vid))
             jf.unlink(missing_ok=True)
         except Exception as e:
             push(f"[post] cleanup error: {e}")
+    return entries
 
 
 def is_playlist(url):
     return ("list=" in url) or ("/@" in url)
 
 
+def is_youtube(url):
+    low = url.lower()
+    return "youtube.com" in low or "youtu.be" in low
+
+
+def yt_args(url):
+    """More bot-resistant player clients for YouTube; keeps the full format
+    list (session cookies would drop it to 0 via SABR, so we stay anonymous)."""
+    if is_youtube(url):
+        return ["--extractor-args", "youtube:player_client=default,web_safari"]
+    return []
+
+
 class Api:
     def __init__(self):
         self.cfg = load_config()
+        self.history = load_history()
         self.proc = None
         self.busy = False
         self.logged_in = False
-        self._jar_cache = {}  # require-key -> (jar_text, expiry); memory only
+        self._jar_cache = {}          # require-key -> (jar_text, expiry); memory only
+        self._q = queue.Queue()
+        self._worker_up = False
+
+    # --- UI bridge ---
 
     def _push(self, line):
         if UI_WIN:
             try:
                 UI_WIN.evaluate_js(f"ui.log({json.dumps(str(line))})")
+            except Exception:
+                pass
+
+    def _item(self, **kw):
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js(f"ui.item({json.dumps(kw)})")
+            except Exception:
+                pass
+
+    def _drop(self, key):
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js(f"ui.drop({json.dumps(key)})")
             except Exception:
                 pass
 
@@ -419,23 +544,40 @@ class Api:
             except Exception:
                 pass
 
-    def _session_args(self, origin="https://www.youtube.com", require="youtube"):
+    # --- session / auth ---
+
+    def _cache_jar(self, key, jar):
+        self._jar_cache[key] = (jar, time.time() + 600)
+
+    def _session_args(self, origin, require):
         """(['--cookies', tmp], tmp) from the profile session, or ([], None).
-        Caller must _shred(tmp) after the yt-dlp run. Jar text is cached in
-        memory for 10 min so repeated retries don't re-open hidden windows."""
+        Caller must _shred(tmp). Jar text cached in memory for 10 min."""
         cached = self._jar_cache.get(require)
         if cached and cached[1] > time.time():
             jar = cached[0]
         else:
             jar = profile_session_jar(origin, require)
-            # negative results cached briefly so cookie-less sites don't cost
-            # a 25s probe on every action
             self._jar_cache[require] = (jar, time.time() + (600 if jar else 120))
         if not jar:
             return [], None
         tmp = APP_DIR / f"session-{os.urandom(4).hex()}.tmp"
         tmp.write_text(jar, encoding="utf-8", newline="\n")
         return ["--cookies", str(tmp)], tmp
+
+    def _auth_for(self, url):
+        """Auth for a url -> (args, tmp). tmp may be None.
+        YouTube stays ANONYMOUS: the account session makes YT serve SABR-only
+        streams (0 downloadable formats). Non-YouTube sites use their session;
+        sonyliv/hotstar use their saved credential files."""
+        da = domain_auth(url)
+        if da:
+            return da, None
+        if is_youtube(url):
+            return [], None
+        host, key = site_key(url)
+        if host:
+            return self._session_args(f"https://{host}/", key)
+        return [], None
 
     @staticmethod
     def _shred(tmp):
@@ -446,15 +588,7 @@ class Api:
             except OSError:
                 pass
 
-    def _site_session(self, url):
-        """Transient session args for a NON-YouTube url ([], None otherwise)."""
-        low = url.lower()
-        if "youtube.com" in low or "youtu.be" in low:
-            return [], None
-        host, key = site_key(url)
-        if not host:
-            return [], None
-        return self._session_args(f"https://{host}/", key)
+    # --- state / folders ---
 
     def download_dir(self):
         d = self.cfg.get("download_dir")
@@ -476,40 +610,61 @@ class Api:
             save_config(self.cfg)
         return self.download_dir()
 
-    def list_formats(self, url):
-        url = (url or "").strip()
-        if not url:
-            return "Paste a URL first."
-        cmd = [YTDLP, "--no-warnings", "-F", "--socket-timeout", "10",
-               "--retries", "2"]
-        if is_playlist(url):
-            cmd += ["--playlist-items", "1"]
-        site_args, site_tmp = self._site_session(url)
-        cmd += site_args
-        cmd.append(url)
-        try:
-            _, out = run_quiet(cmd, timeout=180)
-            if ("Sign in to confirm" in out or "not a bot" in out) and self.logged_in:
-                self._push("[*] formats: bot-check — retrying with your session...")
-                args, tmp = self._session_args()
-                if args:
+    # --- history ---
+
+    def get_history(self):
+        return [{**e, "exists": Path(e.get("path", "")).exists()} for e in self.history]
+
+    def _add_history(self, e):
+        self.history = [x for x in self.history if x.get("id") != e["id"]]
+        self.history.insert(0, e)
+        self.history = self.history[:1000]
+        save_history(self.history)
+        self._item(key=e["id"], status="done", title=e["title"], channel=e["channel"],
+                   duration=e["duration"], size=e["size_h"], format=e["format"],
+                   thumb=e["thumb"], path=e["path"])
+
+    def play(self, key):
+        for e in self.history:
+            if e.get("id") == key:
+                p = e.get("path", "")
+                if p and Path(p).exists():
                     try:
-                        _, out = run_quiet(cmd[:-1] + args + [url], timeout=180)
-                    finally:
-                        self._shred(tmp)
-            return out or "No output."
-        except Exception as e:
-            return f"Failed: {e}"
-        finally:
-            self._shred(site_tmp)
+                        os.startfile(p)  # opens in default player
+                        return "ok"
+                    except OSError as ex:
+                        self._push(f"[!] could not open file: {ex}")
+                        return "error"
+                self._push("[!] file no longer exists at its saved location")
+                return "missing"
+        return "unknown"
+
+    def reveal(self, key):
+        for e in self.history:
+            if e.get("id") == key:
+                p = Path(e.get("path", ""))
+                if p.exists():
+                    subprocess.Popen(["explorer", "/select,", str(p)])
+                    return "ok"
+                if p.parent.exists():
+                    subprocess.Popen(["explorer", str(p.parent)])
+                    return "ok"
+        return "missing"
+
+    def remove(self, key):
+        """Remove an item from the list/history. Does NOT delete the file."""
+        self.history = [e for e in self.history if e.get("id") != key]
+        save_history(self.history)
+        return "ok"
+
+    # --- info / formats ---
 
     def _oembed(self, url):
-        """Bot-check-proof fallback: YouTube oEmbed (title/channel/thumb only)."""
         try:
             u = "https://www.youtube.com/oembed?format=json&url=" + quote(url, safe="")
             with http_get(u, timeout=8) as resp:
                 d = json.loads(resp.read().decode())
-            return {"ok": True, "kind": "video",
+            return {"ok": True, "kind": "video", "id": None,
                     "title": d.get("title") or "Unknown title",
                     "uploader": d.get("author_name") or "", "duration": "",
                     "thumb": d.get("thumbnail_url") or ""}
@@ -517,18 +672,17 @@ class Api:
             return None
 
     def fetch_info(self, url):
-        """Seal-style pre-download info fetch for the config sheet.
-        Must always return a dict — a raised exception would reject the JS
-        promise and strand the sheet in its loading state."""
+        """Pre-download info fetch for the config sheet. Always returns a dict."""
         url = (url or "").strip().strip('"')
         if not url:
             return {"ok": False, "error": "no-url"}
         base = [YTDLP, "--no-warnings", "-J", "--socket-timeout", "10",
-                "--retries", "2", "--extractor-retries", "1"]
+                "--retries", "2", "--extractor-retries", "1", *yt_args(url)]
         base += ["--flat-playlist"] if is_playlist(url) else ["--no-playlist"]
+        args, tmp = self._auth_for(url)
 
-        def attempt(extra):
-            r = subprocess.run([str(c) for c in base + extra + [url]],
+        def attempt():
+            r = subprocess.run([str(c) for c in base + args + [url]],
                                capture_output=True, text=True, encoding="utf-8",
                                errors="replace", creationflags=NO_WINDOW, timeout=45)
             d = json.loads(r.stdout) if (r.stdout or "").strip() else None
@@ -537,36 +691,20 @@ class Api:
                 raise ValueError(tail[-1] if tail else "no data from yt-dlp")
             return d
 
-        site_args, site_tmp = self._site_session(url)
         try:
-            return self.fetch_info_from(attempt(site_args))
+            return self.fetch_info_from(attempt())
         except Exception as e:
             err = str(e)
             self._push(f"[!] info fetch: {err[:160]}")
-            if "Sign in to confirm" in err or "not a bot" in err:
-                if not is_playlist(url):
-                    info = self._oembed(url)
-                    if info:
-                        return info
-                if self.logged_in:
-                    self._push("[*] info fetch: bot-check — retrying with your session...")
-                    args, tmp = self._session_args()
-                    if args:
-                        try:
-                            data = attempt(args)
-                        except Exception as e2:
-                            return {"ok": False, "error": str(e2)[:200]}
-                        finally:
-                            self._shred(tmp)
-                        return self.fetch_info_from(data)
-                err = ("YouTube bot-check — the download itself will still "
-                       "auto-retry with your session")
+            if ("Sign in to confirm" in err or "not a bot" in err) and not is_playlist(url):
+                info = self._oembed(url)
+                if info:
+                    return info
             return {"ok": False, "error": err[:200]}
         finally:
-            self._shred(site_tmp)
+            self._shred(tmp)
 
     def fetch_info_from(self, data):
-        """Build the sheet dict from a yt-dlp -J payload."""
         if data.get("_type") == "playlist" or "entries" in data:
             entries = data.get("entries") or []
             thumb = ""
@@ -574,22 +712,39 @@ class Api:
                 if len(e.get("id") or "") == 11:
                     thumb = f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg"
                     break
-            return {"ok": True, "kind": "playlist",
+            return {"ok": True, "kind": "playlist", "id": None,
                     "title": data.get("title") or "Playlist",
                     "uploader": data.get("uploader") or data.get("channel") or "",
                     "count": len(entries), "thumb": thumb}
         dur = data.get("duration")
-        if dur:
-            h, rem = divmod(int(dur), 3600)
-            m, s = divmod(rem, 60)
-            dur = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-        return {"ok": True, "kind": "video",
+        return {"ok": True, "kind": "video", "id": data.get("id"),
                 "title": data.get("title") or "Unknown title",
                 "uploader": data.get("uploader") or data.get("channel") or "",
-                "duration": dur or "", "thumb": data.get("thumbnail") or ""}
+                "duration": fmt_dur(dur) if dur else "",
+                "thumb": data.get("thumbnail") or ""}
+
+    def list_formats(self, url):
+        url = (url or "").strip()
+        if not url:
+            return "Paste a URL first."
+        cmd = [YTDLP, "--no-warnings", "-F", "--socket-timeout", "10",
+               "--retries", "2", *yt_args(url)]
+        if is_playlist(url):
+            cmd += ["--playlist-items", "1"]
+        args, tmp = self._auth_for(url)
+        cmd += args
+        cmd.append(url)
+        try:
+            _, out = run_quiet(cmd, timeout=180)
+            return out or "No output."
+        except Exception as e:
+            return f"Failed: {e}"
+        finally:
+            self._shred(tmp)
+
+    # --- login ---
 
     def login(self, url=""):
-        """Open a login window for the pasted URL's site (YouTube if empty)."""
         host, _key = site_key((url or "").strip())
         is_yt = not host or "youtube" in host or "youtu.be" in host
         target = "https://www.youtube.com" if is_yt else f"https://{host}/"
@@ -600,14 +755,19 @@ class Api:
             w.events.closed += lambda *a: threading.Thread(
                 target=self._recheck_login, daemon=True).start()
         else:
-            w.events.closed += lambda *a: self._push(
-                f"[login] {host} session saved in profile")
+            def done(*a):
+                self._jar_cache.pop(_key, None)  # force re-read next use
+                self._push(f"[login] {host} session saved in profile")
+            w.events.closed += done
         return "opened"
 
     def _recheck_login(self):
-        self.logged_in = check_login()
-        self._push("[login] signed in" if self.logged_in
-                   else "[login] not signed in — click Login and complete sign-in")
+        logged, jar = probe_youtube()
+        self.logged_in = logged
+        if jar:
+            self._cache_jar("youtube", jar)
+        self._push("[login] signed in" if logged
+                   else "[login] not signed in - click Login and complete sign-in")
         self._set_state()
 
     def update_deps(self):
@@ -622,13 +782,13 @@ class Api:
             self._push("[!] download cancelled")
         return "ok"
 
+    # --- queue ---
+
     def start_download(self, url, fmt_mode, custom_fmt, pl_start, pl_end,
-                       mark_watched=True, set_timestamp=True):
+                       mark_watched=True, set_timestamp=True, meta=None):
         url = (url or "").strip().strip('"')
         if not url:
             return "no-url"
-        if self.busy:
-            return "busy"
         if not (YTDLP.exists() and FFMPEG.exists()):
             return "no-deps"
         fmt = custom_fmt.strip() if (fmt_mode == "custom" and custom_fmt.strip()) else DEFAULT_FORMAT
@@ -638,22 +798,38 @@ class Api:
         self.cfg["mark_watched"] = bool(mark_watched)
         self.cfg["set_timestamp"] = bool(set_timestamp)
         save_config(self.cfg)
-        threading.Thread(target=self._download_worker,
-                         args=(url, fmt, items, bool(mark_watched),
-                               bool(set_timestamp)),
-                         daemon=True).start()
-        return "started"
 
-    def _item(self, **kw):
-        """Upsert a card in the UI queue."""
-        if UI_WIN:
+        meta = meta or {}
+        vid = meta.get("id")
+        if vid:
+            key, placeholder = vid, False
+            self._item(key=key, status="queued", title=meta.get("title"),
+                       channel=meta.get("uploader"), duration=meta.get("duration"),
+                       thumb=meta.get("thumb"))
+        else:
+            key, placeholder = f"job-{os.urandom(3).hex()}", True
+            self._item(key=key, status="queued",
+                       title=meta.get("title") or url, thumb=meta.get("thumb"))
+
+        self._q.put((url, fmt, items, bool(mark_watched), bool(set_timestamp),
+                     key, placeholder))
+        if not self._worker_up:
+            self._worker_up = True
+            threading.Thread(target=self._queue_loop, daemon=True).start()
+        return "queued"
+
+    def _queue_loop(self):
+        while True:
+            job = self._q.get()
             try:
-                UI_WIN.evaluate_js(f"ui.item({json.dumps(kw)})")
-            except Exception:
-                pass
+                self._download_worker(*job)
+            except Exception as e:
+                self._push(f"[!] worker error: {e}")
+            finally:
+                self._q.task_done()
 
     def _make_parser(self):
-        """Turn raw yt-dlp lines into per-video queue card updates."""
+        """Turn raw yt-dlp lines into per-video queue card updates with phases."""
         state = {"cur": None, "items": {}}
 
         def parse(line):
@@ -661,60 +837,63 @@ class Api:
             if m:
                 vid = m.group(1)
                 state["cur"] = vid
-                if vid not in state["items"]:
-                    state["items"][vid] = {"status": "fetching", "last_pct": -1}
-                    self._item(key=vid, status="fetching",
-                               thumb=f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
+                it = state["items"].setdefault(vid, {"pct": -1, "dests": 0})
+                it["status"] = "fetching"
+                self._item(key=vid, status="fetching", phase="Fetching info",
+                           thumb=f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
                 return
             m = RE_DEST.match(line)
             if m:
                 name = os.path.basename(m.group(1))
                 idm = RE_FILE_ID.search(name)
-                key = idm.group(1) if idm else name
+                key = idm.group(1) if idm else re.sub(r"\.f\d+\.\w+$|\.\w+$", "", name)
                 state["cur"] = key
-                it = state["items"].setdefault(key, {"last_pct": -1})
+                it = state["items"].setdefault(key, {"pct": -1, "dests": 0})
+                it["dests"] += 1
+                it["phase"] = "Downloading video" if it["dests"] == 1 else "Downloading audio"
                 it["status"] = "downloading"
                 title = re.sub(r"\.f\d+\.\w+$|\.\w+$", "", name)
                 title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]$", "", title).strip()
-                kw = {"key": key, "status": "downloading", "title": title}
+                kw = {"key": key, "status": "downloading", "phase": it["phase"], "title": title}
                 if idm:
                     kw["thumb"] = f"https://i.ytimg.com/vi/{idm.group(1)}/mqdefault.jpg"
                 self._item(**kw)
                 return
-            cur = state["cur"]
-            it = state["items"].get(cur)
+            it = state["items"].get(state["cur"])
             if it is None:
                 return
+            key = state["cur"]
             m = RE_PROG.match(line)
             if m:
                 pct = float(m.group(1))
-                if int(pct) != it["last_pct"]:  # throttle to whole percents
-                    it["last_pct"] = int(pct)
-                    it["status"] = "downloading"
-                    self._item(key=cur, status="downloading", pct=pct,
-                               speed=m.group(2) or "", eta=m.group(3) or "")
+                if int(pct) != it["pct"]:
+                    it["pct"] = int(pct)
+                    self._item(key=key, status="downloading", phase=it.get("phase"),
+                               pct=pct, speed=m.group(2) or "", eta=m.group(3) or "")
                 return
-            if line.startswith(POST_PREFIXES):
-                if it["status"] != "processing":
-                    it["status"] = "processing"
-                    self._item(key=cur, status="processing", pct=100)
+            phase = None
+            if line.startswith("[Merger]"):
+                phase = "Merging"
+            elif line.startswith("[Metadata]"):
+                phase = "Embedding metadata"
+            elif line.startswith(("[EmbedThumbnail]", "[ThumbnailsConvertor]")):
+                phase = "Embedding thumbnail"
+            elif line.startswith("[ExtractAudio]"):
+                phase = "Extracting audio"
+            elif line.startswith("[Fixup"):
+                phase = "Finalizing"
+            if phase:
+                it["status"] = "processing"
+                it["phase"] = phase
+                self._item(key=key, status="processing", phase=phase, pct=100)
                 return
             if line.startswith("ERROR"):
                 it["status"] = "failed"
-                self._item(key=cur, status="failed")
+                self._item(key=key, status="failed")
 
-        def finalize(ok):
-            for key, it in state["items"].items():
-                if it["status"] == "failed":
-                    continue
-                it["status"] = "done" if ok else "failed"
-                self._item(key=key, status=it["status"],
-                           pct=100 if ok else None)
-
-        return parse, finalize
+        return parse, state
 
     def _run_ytdlp(self, cmd, dl_dir, on_line=None):
-        """Stream one yt-dlp run into the log; returns (exit_code, bot_checked)."""
         code, botcheck = 1, False
         try:
             self.proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
@@ -740,47 +919,44 @@ class Api:
             self.proc = None
         return code, botcheck
 
-    def _download_worker(self, url, fmt, items, mark=True, stamp=True):
+    def _download_worker(self, url, fmt, items, mark, stamp, job_key, placeholder):
+        if placeholder:
+            self._drop(job_key)
         self.busy = True
         self._set_state()
         started = time.time()
         dl_dir = self.download_dir()
-        cmd = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR)]
+        cmd = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
+               *yt_args(url)]
         if items:
             cmd += ["--playlist-items", items]
         if is_playlist(url):
-            cmd += ["--ignore-errors"]  # ponytail: yt-dlp presses on per-video; no outer retry loop
-        auth = domain_auth(url)
-        site_tmp = None
-        if not auth:
-            args, site_tmp = self._site_session(url)
-            if args:
-                auth = args
-                self._push("[*] using saved site session (transient)")
+            cmd += ["--ignore-errors"]
+        auth, tmp = self._auth_for(url)  # anonymous for YouTube; session for other sites
         cmd += auth
         cmd.append(url)
         self._push(f"[*] downloading: {url}")
-        parse, finalize = self._make_parser()
+        parse, state = self._make_parser()
         code, botcheck = self._run_ytdlp(cmd, dl_dir, parse)
+        self._shred(tmp)
+
         if code != 0 and botcheck:
-            if self.logged_in:
-                self._push("[!] YouTube bot-check — retrying with your signed-in "
-                           "session (used for this download only, then destroyed)")
-                args, tmp = self._session_args()
-                if args:
-                    try:
-                        code, _ = self._run_ytdlp(cmd[:-1] + args + [cmd[-1]],
-                                                  dl_dir, parse)
-                    finally:
-                        self._shred(tmp)
-                else:
-                    self._push("[!] could not read session from profile")
-            else:
-                self._push("[!] YouTube bot-check — click Login so retries can "
-                           "use your session")
-        self._shred(site_tmp)
-        postprocess(dl_dir, started, self, mark, stamp)
-        finalize(code == 0)
+            self._push("[!] YouTube bot-check: this IP is temporarily flagged "
+                       "(usually from many rapid downloads). Wait a bit and retry; "
+                       "it clears on its own. (Cookies don't help - they yield 0 "
+                       "downloadable formats via SABR.)")
+
+        entries = postprocess(dl_dir, started, self, mark, stamp)
+        done_ids = set()
+        for e in entries:
+            self._add_history(e)
+            done_ids.add(e["id"])
+        for key, it in state["items"].items():
+            if key not in done_ids and it.get("status") != "done":
+                self._item(key=key, status="failed")
+        if not placeholder and job_key not in done_ids and not entries:
+            self._item(key=job_key, status="failed")
+
         self._push("[+] done" if code == 0 else f"[!] finished with errors (exit {code})")
         self.busy = False
         self._set_state()
@@ -791,7 +967,7 @@ class Api:
                 pass
 
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
 :root {
   color-scheme: dark;
@@ -851,6 +1027,9 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
 .dim { color:var(--onvar); font-size:12.5px; }
 .path { font-size:12.5px; color:var(--primary); overflow:hidden;
   text-overflow:ellipsis; white-space:nowrap; max-width:430px; }
+#listhead { display:flex; align-items:center; gap:8px; padding:0 4px; }
+#listhead .t { font-size:12.5px; font-weight:600; color:var(--onvar);
+  text-transform:uppercase; letter-spacing:.6px; }
 #queue { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column;
   gap:8px; padding:2px; }
 .empty { flex:1; display:flex; flex-direction:column; align-items:center;
@@ -859,33 +1038,40 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
 .empty svg { opacity:.45; }
 .empty span { font-size:13px; }
 .qcard { display:flex; gap:12px; align-items:center; padding:10px 12px; flex:none;
-  background:var(--surf2); border-radius:16px; }
+  background:var(--surf2); border-radius:16px; transition:background .15s; }
+.qcard.playable { cursor:pointer; }
+.qcard.playable:hover { background:var(--surf3); }
+.qcard.missing { opacity:.5; }
 .qthumb { width:100px; height:56px; border-radius:10px; object-fit:cover;
-  background:var(--surf3); flex:none; }
+  background:var(--surf3); flex:none; position:relative; }
 .qbody { flex:1; min-width:0; display:flex; flex-direction:column; gap:6px; }
 .qtitle { font-size:13.5px; font-weight:500; white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; }
-.qmeta { font-size:11.5px; color:var(--onvar); font-variant-numeric:tabular-nums; }
+.qmeta { font-size:11.5px; color:var(--onvar); font-variant-numeric:tabular-nums;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .qbar { height:4px; border-radius:2px; background:var(--outvar); overflow:hidden; }
 .qbar i { display:block; height:100%; width:0; border-radius:2px;
   background:var(--primary); transition:width .3s ease-out; }
-.qcard.done .qbar i { background:var(--green); width:100%; }
-.qcard.failed .qbar i { background:var(--red); }
+.qcard.done .qbar, .qcard.failed .qbar, .qcard.queued .qbar { display:none; }
 .qcard.processing .qbar i { background:#CCC2DC; }
-.qstate { flex:none; width:28px; height:28px; display:flex; align-items:center;
+.qstate { flex:none; width:26px; height:26px; display:flex; align-items:center;
   justify-content:center; }
 .spin { width:15px; height:15px; border-radius:50%;
   border:2px solid var(--outvar); border-top-color:var(--primary);
   animation:spin .8s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
 .okmark { color:var(--green); } .badmark { color:var(--red); }
+.qdel { display:none; flex:none; width:34px; height:34px; border:none; border-radius:50%;
+  background:transparent; color:var(--onvar); cursor:pointer; align-items:center;
+  justify-content:center; transition:background .15s, color .15s; }
+.qdel:hover { background:rgba(242,184,181,.14); color:var(--red); }
 .console { flex:none; background:var(--surf1); border-radius:16px; overflow:hidden; }
 .console-head { display:flex; align-items:center; gap:9px; padding:11px 16px;
   cursor:pointer; color:var(--onvar); font-size:12.5px; font-weight:500; }
 .console-head:hover { color:var(--on); }
 .chev { transition:transform .2s; }
 .console.open .chev { transform:rotate(90deg); }
-#log { display:none; height:165px; overflow-y:auto; padding:4px 16px 12px;
+#log { display:none; height:150px; overflow-y:auto; padding:4px 16px 12px;
   border-top:1px solid var(--outvar); white-space:pre-wrap; user-select:text;
   font:12px/1.65 "Cascadia Mono",Consolas,monospace; color:#A8A2B0; }
 .console.open #log { display:block; }
@@ -974,12 +1160,15 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
   </div>
 </section>
 
+<div id="listhead"><span class="t">Downloads</span><span class="spacer"></span>
+  <span class="dim" style="font-size:11px">double-click a finished item to play</span></div>
+
 <div id="queue">
   <div class="empty" id="empty">
     <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor"
          stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
       <path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
-    <span>Paste a link above — downloads appear here as cards</span>
+    <span>Paste a link above &mdash; downloads appear here</span>
   </div>
 </div>
 
@@ -990,7 +1179,7 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
          stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
     Console
     <span class="spacer"></span>
-    <span id="counts" class="chip"><span class="dot"></span>ok 0 · failed 0</span>
+    <span id="counts" class="chip"><span class="dot"></span>ok 0 &middot; failed 0</span>
   </div>
   <div id="log"></div>
 </section>
@@ -1001,22 +1190,22 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
   <div class="media">
     <img id="s-thumb" alt="">
     <div style="min-width:0">
-      <div id="s-title">…</div>
+      <div id="s-title">&hellip;</div>
       <div id="s-sub" class="msub"></div>
     </div>
   </div>
   <div class="srow">
     <span class="slabel">Quality</span>
     <select id="quality" aria-label="Quality" onchange="qualityChanged()">
-      <option value="default" selected>Default · 720–1080 VP9</option>
+      <option value="default" selected>Default &middot; 720&ndash;1080 VP9</option>
       <option value="bv*+ba/b">Best available</option>
-      <option value="bv*[height<=2160]+ba/b[height<=2160]">4K · 2160p</option>
+      <option value="bv*[height<=2160]+ba/b[height<=2160]">4K &middot; 2160p</option>
       <option value="bv*[height<=1440]+ba/b[height<=1440]">1440p</option>
       <option value="bv*[height<=1080]+ba/b[height<=1080]">1080p</option>
       <option value="bv*[height<=720]+ba/b[height<=720]">720p</option>
       <option value="bv*[height<=480]+ba/b[height<=480]">480p</option>
       <option value="ba[ext=m4a]/ba">Audio only</option>
-      <option value="custom">Custom selector…</option>
+      <option value="custom">Custom selector&hellip;</option>
     </select>
     <input type="text" id="customfmt" placeholder="e.g. 137+140 or bv+ba" spellcheck="false">
   </div>
@@ -1043,18 +1232,26 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
 
 <script>
 var okCount = 0, failCount = 0, lastProg = null;
-var logEl, pendingUrl = null;
+var logEl, pendingUrl = null, lastInfo = null;
+var cards = {};
 var STATUS_LABEL = { fetching:"Fetching info", downloading:"Downloading",
-                     processing:"Processing", done:"Completed", failed:"Failed" };
+                     processing:"Processing", done:"Completed", failed:"Failed",
+                     queued:"Queued" };
 var ICON_OK = '<svg class="okmark" width="18" height="18" viewBox="0 0 24 24" fill="none"' +
   ' stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
   '<path d="M20 6 9 17l-5-5"/></svg>';
 var ICON_BAD = '<svg class="badmark" width="18" height="18" viewBox="0 0 24 24" fill="none"' +
   ' stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
   '<path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
-function toggleConsole() {
-  document.getElementById("console").classList.toggle("open");
-}
+var ICON_CLOCK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none"' +
+  ' stroke="#938F99" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
+var ICON_TRASH = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"' +
+  ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/>' +
+  '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
+
+function toggleConsole() { document.getElementById("console").classList.toggle("open"); }
 function lineClass(t) {
   if (t.indexOf("[+]") === 0) return "c-green";
   if (t.indexOf("[!]") === 0 || t.indexOf("ERROR") === 0) return "c-red";
@@ -1067,45 +1264,92 @@ function setChip(el, label, cls) {
   el.className = "chip " + cls;
   el.innerHTML = '<span class="dot"></span>' + label;
 }
+function updateEmpty() {
+  var q = document.getElementById("queue");
+  var has = q.querySelector(".qcard");
+  var e = document.getElementById("empty");
+  if (has && e) e.remove();
+  if (!has && !e) {
+    var d = document.createElement("div");
+    d.className = "empty"; d.id = "empty";
+    d.innerHTML = '<svg width="42" height="42" viewBox="0 0 24 24" fill="none"' +
+      ' stroke="currentColor" stroke-width="1.6" stroke-linecap="round"' +
+      ' stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/>' +
+      '<path d="M4 21h16"/></svg><span>Paste a link above &mdash; downloads appear here</span>';
+    q.appendChild(d);
+  }
+}
+function metaText(o) {
+  if (o.status === "done")
+    return [o.channel, o.duration, o.size, o.format].filter(Boolean).join(" · ")
+           || "Completed";
+  if (o.status === "downloading") {
+    var p = [o.phase || "Downloading"];
+    if (o.pct != null) p.push(Math.round(o.pct) + "%");
+    if (o.speed) p.push(o.speed);
+    if (o.eta) p.push("ETA " + o.eta);
+    return p.join(" · ");
+  }
+  if (o.status === "processing") return o.phase || "Processing";
+  return o.phase || STATUS_LABEL[o.status] || o.status || "";
+}
+function makeCard(key) {
+  var el = document.createElement("div");
+  el.className = "qcard"; el.id = "q-" + key;
+  el.innerHTML =
+    '<img class="qthumb" style="display:none" alt="">' +
+    '<div class="qbody"><div class="qtitle">…</div>' +
+    '<div class="qmeta"></div><div class="qbar"><i></i></div></div>' +
+    '<div class="qstate"></div>' +
+    '<button class="qdel" title="Remove from list">' + ICON_TRASH + '</button>';
+  el.addEventListener("dblclick", function () {
+    if (cards[key] && cards[key].path) pywebview.api.play(key);
+  });
+  el.querySelector(".qdel").addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    pywebview.api.remove(key);
+    var n = document.getElementById("q-" + key);
+    if (n) n.remove();
+    delete cards[key];
+    updateEmpty();
+  });
+  document.getElementById("queue").prepend(el);
+  return el;
+}
 var ui = {
   item: function (o) {
-    var e = document.getElementById("empty");
-    if (e) e.remove();
-    var el = document.getElementById("q-" + o.key);
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "qcard";
-      el.id = "q-" + o.key;
-      el.innerHTML = '<img class="qthumb" style="display:none" alt="">' +
-        '<div class="qbody"><div class="qtitle">…</div>' +
-        '<div class="qmeta">Starting</div><div class="qbar"><i></i></div></div>' +
-        '<div class="qstate"><span class="spin"></span></div>';
-      document.getElementById("queue").prepend(el);
-    }
-    if (o.thumb) {
+    var key = o.key;
+    var el = document.getElementById("q-" + key);
+    if (!el) { el = makeCard(key); }
+    var c = cards[key] || {};
+    for (var k in o) if (o[k] != null) c[k] = o[k];
+    cards[key] = c;
+    var e = document.getElementById("empty"); if (e) e.remove();
+    // thumb (set once)
+    if (c.thumb) {
       var im = el.querySelector(".qthumb");
       if (!im.getAttribute("src")) {
         im.onerror = function () { im.style.display = "none"; };
-        im.src = o.thumb;
-        im.style.display = "";
+        im.src = c.thumb; im.style.display = "";
       }
     }
-    if (o.title) el.querySelector(".qtitle").textContent = o.title;
-    if (o.pct != null) el.querySelector(".qbar i").style.width = o.pct + "%";
-    if (o.status) {
-      el.className = "qcard " + o.status;
-      var meta = STATUS_LABEL[o.status] || o.status;
-      if (o.status === "downloading" && o.pct != null) {
-        meta += " · " + Math.round(o.pct) + "%";
-        if (o.speed) meta += " · " + o.speed;
-        if (o.eta) meta += " · ETA " + o.eta;
-      }
-      el.querySelector(".qmeta").textContent = meta;
-      var st = el.querySelector(".qstate");
-      if (o.status === "done") st.innerHTML = ICON_OK;
-      else if (o.status === "failed") st.innerHTML = ICON_BAD;
-      else if (!st.querySelector(".spin")) st.innerHTML = '<span class="spin"></span>';
-    }
+    el.querySelector(".qtitle").textContent = c.title || "…";
+    el.className = "qcard " + (c.status || "") +
+      (c.exists === false ? " missing" : "") + (c.path ? " playable" : "");
+    el.querySelector(".qmeta").textContent = metaText(c);
+    if (c.pct != null) el.querySelector(".qbar i").style.width = c.pct + "%";
+    var st = el.querySelector(".qstate");
+    if (c.status === "done") st.innerHTML = c.exists === false ? ICON_BAD : ICON_OK;
+    else if (c.status === "failed") st.innerHTML = ICON_BAD;
+    else if (c.status === "queued") st.innerHTML = ICON_CLOCK;
+    else st.innerHTML = '<span class="spin"></span>';
+    el.querySelector(".qdel").style.display = c.path ? "flex" : "none";
+  },
+  drop: function (key) {
+    var n = document.getElementById("q-" + key);
+    if (n) n.remove();
+    delete cards[key];
+    updateEmpty();
   },
   log: function (t) {
     var isProg = t.indexOf("[download]") === 0 && t.indexOf("%") !== -1;
@@ -1113,8 +1357,7 @@ var ui = {
     else {
       var d = document.createElement("div");
       d.textContent = t;
-      var c = lineClass(t);
-      if (c) d.className = c;
+      var c = lineClass(t); if (c) d.className = c;
       logEl.appendChild(d);
       lastProg = isProg ? d : null;
       if (logEl.childElementCount > 2000) logEl.removeChild(logEl.firstChild);
@@ -1129,8 +1372,8 @@ var ui = {
     setChip(document.getElementById("deps"),
             s.deps_ok ? "deps ready" : "deps missing",
             s.deps_ok ? "ok" : "warn");
-    document.getElementById("dl").disabled = s.busy || !s.deps_ok;
-    document.getElementById("s-go").disabled = s.busy || !s.deps_ok;
+    document.getElementById("dl").disabled = !s.deps_ok;   // queue-friendly: never busy-locked
+    document.getElementById("s-go").disabled = !s.deps_ok;
     document.getElementById("cancel").disabled = !s.busy;
   },
   done: function (ok) {
@@ -1147,18 +1390,17 @@ function qualityChanged() {
 function startDl() {
   var u = document.getElementById("url").value.trim();
   if (!u) { ui.log("[!] paste a URL first"); return; }
-  pendingUrl = u;
+  pendingUrl = u; lastInfo = null;
   openSheet(u);
   pywebview.api.fetch_info(u).then(function (info) {
-    if (pendingUrl === u) fillSheet(info, u);
+    if (pendingUrl === u) { lastInfo = info; fillSheet(info, u); }
   })["catch"](function () {
     if (pendingUrl === u) fillSheet({ ok: false, error: "" }, u);
   });
 }
 function openSheet(u) {
   var t = document.getElementById("s-thumb");
-  t.style.display = "none";
-  t.removeAttribute("src");
+  t.style.display = "none"; t.removeAttribute("src");
   document.getElementById("s-title").textContent = "Fetching info…";
   document.getElementById("s-sub").textContent = u;
   var isPl = u.indexOf("list=") !== -1 || u.indexOf("/@") !== -1;
@@ -1181,8 +1423,7 @@ function fillSheet(info, u) {
     document.getElementById("s-sub").textContent = sub;
     if (info.thumb) {
       t.onerror = function () { t.style.display = "none"; };
-      t.src = info.thumb;
-      t.style.display = "";
+      t.src = info.thumb; t.style.display = "";
     }
   } else {
     document.getElementById("s-title").textContent =
@@ -1200,15 +1441,19 @@ function confirmDl() {
   var mode = q === "default" ? "default" : "custom";
   var custom = q === "custom" ? document.getElementById("customfmt").value : q;
   if (q === "default") custom = "";
+  var meta = (lastInfo && lastInfo.ok && lastInfo.kind === "video") ? {
+    id: lastInfo.id, title: lastInfo.title, uploader: lastInfo.uploader,
+    duration: lastInfo.duration, thumb: lastInfo.thumb
+  } : (lastInfo && lastInfo.ok ? { title: lastInfo.title, thumb: lastInfo.thumb } : {});
   closeSheet();
   pywebview.api.start_download(
     pendingUrl, mode, custom,
     document.getElementById("plstart").value,
     document.getElementById("plend").value,
     document.getElementById("ck-watched").checked,
-    document.getElementById("ck-stamp").checked
+    document.getElementById("ck-stamp").checked,
+    meta
   ).then(function (r) {
-    if (r === "busy") ui.log("[!] a download is already running");
     if (r === "no-deps") ui.log("[!] dependencies missing — tap the refresh icon");
   });
 }
@@ -1225,27 +1470,40 @@ function pickDir() {
   });
 }
 document.addEventListener("keydown", function (e) {
-  if (e.key === "Escape") closeSheet();
+  var sheetOpen = document.getElementById("sheet").className.indexOf("open") !== -1;
+  if (e.key === "Escape") { closeSheet(); return; }
+  if (e.key === "Enter") {
+    if (sheetOpen) { confirmDl(); }
+    else if (document.activeElement === document.getElementById("url")) { startDl(); }
+  }
 });
 window.addEventListener("pywebviewready", function () {
   logEl = document.getElementById("log");
+  document.getElementById("url").focus();
   pywebview.api.get_state().then(function (s) {
     ui.setState(s);
     document.getElementById("ck-watched").checked = s.mark_watched !== false;
     document.getElementById("ck-stamp").checked = s.set_timestamp !== false;
+  });
+  pywebview.api.get_history().then(function (list) {
+    list.slice().reverse().forEach(function (e) {
+      ui.item({ key: e.id, status: "done", title: e.title, channel: e.channel,
+                duration: e.duration, size: e.size_h, format: e.format,
+                thumb: e.thumb, path: e.path, exists: e.exists });
+    });
   });
 });
 </script></body></html>"""
 
 
 def bootstrap(api):
-    for _ in range(60):  # wait for the page before pushing log lines
+    for _ in range(60):
         try:
             UI_WIN.evaluate_js("1")
             break
         except Exception:
             time.sleep(0.25)
-    api._push(f"[*] {APP_NAME} started — data dir: {APP_DIR}")
+    api._push(f"[*] {APP_NAME} started - data dir: {APP_DIR}")
     ensure_deps(api._push)
     api._set_state()
     api._push("[login] checking sign-in state...")
@@ -1257,12 +1515,11 @@ def main():
     if "--setup" in sys.argv:
         ok = ensure_deps(log)
         sys.exit(0 if ok else 1)
-    # purge cookies extracted by earlier versions — nothing leaves the profile now
     (APP_DIR / "cookies_youtube.txt").unlink(missing_ok=True)
     global UI_WIN
     api = Api()
     UI_WIN = webview.create_window(APP_NAME, html=HTML, js_api=api,
-                                   width=980, height=760, min_size=(760, 560))
+                                   width=980, height=780, min_size=(760, 560))
     webview.start(lambda: bootstrap(api), private_mode=False,
                   storage_path=str(PROFILE_DIR))
 
