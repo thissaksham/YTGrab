@@ -35,7 +35,29 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
+
+
+def _resolve_app_dir():
+    """Where deps/profile/config/history live. An installed build (onedir, has
+    an _internal folder) keeps its data beside the app so everything lives in
+    the user-chosen install folder; the loose single-file exe and dev runs use
+    %LOCALAPPDATA%\\YTGrab."""
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        if (exe_dir / "_internal").is_dir():
+            cand = exe_dir / "data"
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                t = cand / ".w"
+                t.write_text("x", encoding="utf-8")
+                t.unlink()
+                return cand
+            except OSError:
+                pass
+    return Path(os.environ["LOCALAPPDATA"]) / APP_NAME
+
+
+APP_DIR = _resolve_app_dir()
 BIN_DIR = APP_DIR / "bin"
 PROFILE_DIR = APP_DIR / "profile"
 CONFIG_FILE = APP_DIR / "config.json"
@@ -344,7 +366,10 @@ def run_quiet(cmd, push=None, timeout=None):
     return proc.returncode, "\n".join(out)
 
 
-def ensure_deps(push):
+def ensure_deps(push, force_ffmpeg=False):
+    """yt-dlp is kept current every launch (YouTube breaks it constantly).
+    ffmpeg is a stable tool: fetched once when missing and never auto-updated
+    -- pass force_ffmpeg=True (the Update button) to refresh it on demand."""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     try:
         if YTDLP.exists():
@@ -357,6 +382,10 @@ def ensure_deps(push):
     except Exception as e:
         push(f"[deps] yt-dlp setup failed: {e}")
 
+    have_ff = FFMPEG.exists() and FFPROBE.exists()
+    if have_ff and not force_ffmpeg:
+        push("[deps] ffmpeg present (auto-update off; use Update to refresh)")
+        return YTDLP.exists() and have_ff
     try:
         remote = ""
         for url in FF_VER_URLS:
@@ -367,10 +396,9 @@ def ensure_deps(push):
             except Exception:
                 continue
         local = FF_VER_FILE.read_text().strip() if FF_VER_FILE.exists() else ""
-        have = FFMPEG.exists() and FFPROBE.exists()
-        if have and remote and remote == local:
+        if have_ff and remote and remote == local:
             push(f"[deps] ffmpeg {local} is up to date")
-        elif have and not remote:
+        elif have_ff and not remote:
             push("[deps] ffmpeg version check failed; keeping existing build")
         else:
             push(f"[deps] downloading ffmpeg {remote or ''}...".rstrip() + " (~90 MB)")
@@ -771,8 +799,10 @@ class Api:
         self._set_state()
 
     def update_deps(self):
-        threading.Thread(target=lambda: (ensure_deps(self._push), self._set_state()),
-                         daemon=True).start()
+        # manual button: force an ffmpeg refresh too
+        threading.Thread(
+            target=lambda: (ensure_deps(self._push, force_ffmpeg=True), self._set_state()),
+            daemon=True).start()
         return "updating"
 
     def cancel(self):
@@ -1535,6 +1565,14 @@ def bootstrap(api):
 
 def main():
     if "--ping" in sys.argv:   # boot-cost probe: exits before any window
+        sys.exit(0)
+    if "--where" in sys.argv:  # diagnostic: report resolved paths
+        (Path(tempfile.gettempdir()) / "ytgrab_where.txt").write_text(
+            f"frozen={getattr(sys, 'frozen', False)}\n"
+            f"executable={sys.executable}\n"
+            f"exe_parent={Path(sys.executable).resolve().parent}\n"
+            f"has_internal={(Path(sys.executable).resolve().parent / '_internal').is_dir()}\n"
+            f"APP_DIR={APP_DIR}\n", encoding="utf-8")
         sys.exit(0)
     APP_DIR.mkdir(parents=True, exist_ok=True)
     if "--setup" in sys.argv:
