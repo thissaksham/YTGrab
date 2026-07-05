@@ -1,7 +1,10 @@
 ; YTGrab installer — bundles the fast (onedir) build so startup stays quick.
-; Build: iscc installer.iss  (after building the onedir into dist\YTGrab\)
+; Bundles ffmpeg/ffprobe (stable) and downloads the latest yt-dlp during setup,
+; so the app opens ready-to-use with no first-launch dependency download.
+; Build needs: dist\YTGrab\ (onedir), deps\ffmpeg.exe, deps\ffprobe.exe.
+; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.1.1"
+#define AppVersion "1.2.0"
 #define AppExe "YTGrab.exe"
 
 [Setup]
@@ -39,6 +42,11 @@ Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFPROBE"; Valu
 [Files]
 ; the entire onedir build (exe + _internal folder)
 Source: "dist\YTGrab\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; bundled stable tools -> app's data\bin so deps are ready without downloading
+Source: "deps\ffmpeg.exe"; DestDir: "{app}\data\bin"; Flags: ignoreversion
+Source: "deps\ffprobe.exe"; DestDir: "{app}\data\bin"; Flags: ignoreversion
+; latest yt-dlp downloaded to {tmp} during setup (below); copied if it succeeded
+Source: "{tmp}\yt-dlp.exe"; DestDir: "{app}\data\bin"; Flags: external ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -51,3 +59,21 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait pos
 [UninstallDelete]
 ; remove app data (deps, profile, config, history) that the app wrote beside itself
 Type: filesandordirs; Name: "{app}\data"
+
+[Code]
+// Fetch the latest yt-dlp into {tmp} right before files are copied. Works in
+// both interactive and silent installs; the [Files] entry above copies it in
+// (and is skipped if this failed -- the app then fetches yt-dlp on first run).
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then begin
+    try
+      DownloadTemporaryFile(
+        'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe',
+        'yt-dlp.exe', '', nil);
+    except
+      Log('yt-dlp download failed (app will fetch it on first run): '
+          + GetExceptionMessage);
+    end;
+  end;
+end;

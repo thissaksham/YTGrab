@@ -5,6 +5,9 @@ build/
 __pycache__/
 *.pyc
 
+# bundled binaries for the installer (fetched locally, not versioned)
+deps/
+
 # never commit sessions/cookies
 cookies_*.txt
 .yt_webview_profile/
