@@ -1,7 +1,7 @@
 ; YTGrab installer — bundles the fast (onedir) build so startup stays quick.
 ; Build: iscc installer.iss  (after building the onedir into dist\YTGrab\)
 #define AppName "YTGrab"
-#define AppVersion "1.1.0"
+#define AppVersion "1.1.1"
 #define AppExe "YTGrab.exe"
 
 [Setup]
@@ -24,9 +24,17 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
+ChangesEnvironment=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
+Name: "envvars"; Description: "Set YTDLP, FFMPEG and FFPROBE environment variables (point to this app's tools, for scripts and the command line)"; GroupDescription: "Advanced:"; Flags: unchecked
+
+[Registry]
+; user env vars pointing at the app-managed (auto-updated) binaries in data\bin
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "YTDLP"; ValueData: "{app}\data\bin\yt-dlp.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFMPEG"; ValueData: "{app}\data\bin\ffmpeg.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFPROBE"; ValueData: "{app}\data\bin\ffprobe.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
 
 [Files]
 ; the entire onedir build (exe + _internal folder)
