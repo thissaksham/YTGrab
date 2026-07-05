@@ -1049,6 +1049,9 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
   text-overflow:ellipsis; }
 .qmeta { font-size:11.5px; color:var(--onvar); font-variant-numeric:tabular-nums;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.qpath { display:none; font-size:11px; color:#79747E; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis; direction:rtl; text-align:left;
+  user-select:text; }
 .qbar { height:4px; border-radius:2px; background:var(--outvar); overflow:hidden; }
 .qbar i { display:block; height:100%; width:0; border-radius:2px;
   background:var(--primary); transition:width .3s ease-out; }
@@ -1061,10 +1064,11 @@ select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
   animation:spin .8s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
 .okmark { color:var(--green); } .badmark { color:var(--red); }
-.qdel { display:none; flex:none; width:34px; height:34px; border:none; border-radius:50%;
-  background:transparent; color:var(--onvar); cursor:pointer; align-items:center;
-  justify-content:center; transition:background .15s, color .15s; }
+.qdel, .qfolder { display:none; flex:none; width:34px; height:34px; border:none;
+  border-radius:50%; background:transparent; color:var(--onvar); cursor:pointer;
+  align-items:center; justify-content:center; transition:background .15s, color .15s; }
 .qdel:hover { background:rgba(242,184,181,.14); color:var(--red); }
+.qfolder:hover { background:rgba(208,188,255,.14); color:var(--primary); }
 .console { flex:none; background:var(--surf1); border-radius:16px; overflow:hidden; }
 .console-head { display:flex; align-items:center; gap:9px; padding:11px 16px;
   cursor:pointer; color:var(--onvar); font-size:12.5px; font-weight:500; }
@@ -1250,6 +1254,9 @@ var ICON_TRASH = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"' +
   ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
   '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/>' +
   '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
+var ICON_FOLDER = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"' +
+  ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>';
 
 function toggleConsole() { document.getElementById("console").classList.toggle("open"); }
 function lineClass(t) {
@@ -1299,11 +1306,16 @@ function makeCard(key) {
   el.innerHTML =
     '<img class="qthumb" style="display:none" alt="">' +
     '<div class="qbody"><div class="qtitle">…</div>' +
-    '<div class="qmeta"></div><div class="qbar"><i></i></div></div>' +
+    '<div class="qmeta"></div><div class="qpath"></div><div class="qbar"><i></i></div></div>' +
     '<div class="qstate"></div>' +
+    '<button class="qfolder" title="Open containing folder">' + ICON_FOLDER + '</button>' +
     '<button class="qdel" title="Remove from list">' + ICON_TRASH + '</button>';
   el.addEventListener("dblclick", function () {
     if (cards[key] && cards[key].path) pywebview.api.play(key);
+  });
+  el.querySelector(".qfolder").addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    pywebview.api.reveal(key);
   });
   el.querySelector(".qdel").addEventListener("click", function (ev) {
     ev.stopPropagation();
@@ -1337,13 +1349,24 @@ var ui = {
     el.className = "qcard " + (c.status || "") +
       (c.exists === false ? " missing" : "") + (c.path ? " playable" : "");
     el.querySelector(".qmeta").textContent = metaText(c);
+    var pe = el.querySelector(".qpath");
+    if (c.path) {
+      var dir = c.path.replace(/[\\/][^\\/]*$/, "");
+      pe.textContent = dir + "‎";  // LRM keeps rtl-truncated path readable
+      pe.title = c.path;
+      pe.style.display = "block";
+    } else {
+      pe.style.display = "none";
+    }
     if (c.pct != null) el.querySelector(".qbar i").style.width = c.pct + "%";
     var st = el.querySelector(".qstate");
     if (c.status === "done") st.innerHTML = c.exists === false ? ICON_BAD : ICON_OK;
     else if (c.status === "failed") st.innerHTML = ICON_BAD;
     else if (c.status === "queued") st.innerHTML = ICON_CLOCK;
     else st.innerHTML = '<span class="spin"></span>';
-    el.querySelector(".qdel").style.display = c.path ? "flex" : "none";
+    var vis = c.path ? "flex" : "none";
+    el.querySelector(".qdel").style.display = vis;
+    el.querySelector(".qfolder").style.display = vis;
   },
   drop: function (key) {
     var n = document.getElementById("q-" + key);
