@@ -37,27 +37,9 @@ import webview
 APP_NAME = "YTGrab"
 
 
-def _resolve_app_dir():
-    """Where deps/profile/config/history live. An installed build (onedir, has
-    an _internal folder) keeps its data beside the app so everything lives in
-    the user-chosen install folder; the loose single-file exe and dev runs use
-    %LOCALAPPDATA%\\YTGrab."""
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        if (exe_dir / "_internal").is_dir():
-            cand = exe_dir / "data"
-            try:
-                cand.mkdir(parents=True, exist_ok=True)
-                t = cand / ".w"
-                t.write_text("x", encoding="utf-8")
-                t.unlink()
-                return cand
-            except OSError:
-                pass
-    return Path(os.environ["LOCALAPPDATA"]) / APP_NAME
-
-
-APP_DIR = _resolve_app_dir()
+# All app data (deps, browser profile, config, history) lives here for BOTH
+# the portable exe and the installed build, so login/history/tools are shared.
+APP_DIR = Path(os.environ["LOCALAPPDATA"]) / APP_NAME
 BIN_DIR = APP_DIR / "bin"
 PROFILE_DIR = APP_DIR / "profile"
 CONFIG_FILE = APP_DIR / "config.json"

@@ -4,7 +4,7 @@
 ; Build needs: dist\YTGrab\ (onedir), deps\ffmpeg.exe, deps\ffprobe.exe.
 ; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.3.0"
+#define AppVersion "1.3.1"
 #define AppExe "YTGrab.exe"
 
 [Setup]
@@ -35,18 +35,18 @@ Name: "envvars"; Description: "Set YTDLP, FFMPEG and FFPROBE environment variabl
 
 [Registry]
 ; user env vars pointing at the app-managed (auto-updated) binaries in data\bin
-Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "YTDLP"; ValueData: "{app}\data\bin\yt-dlp.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
-Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFMPEG"; ValueData: "{app}\data\bin\ffmpeg.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
-Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFPROBE"; ValueData: "{app}\data\bin\ffprobe.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "YTDLP"; ValueData: "{localappdata}\YTGrab\bin\yt-dlp.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFMPEG"; ValueData: "{localappdata}\YTGrab\bin\ffmpeg.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFPROBE"; ValueData: "{localappdata}\YTGrab\bin\ffprobe.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
 
 [Files]
 ; the entire onedir build (exe + _internal folder)
 Source: "dist\YTGrab\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; bundled stable tools -> app's data\bin so deps are ready without downloading
-Source: "deps\ffmpeg.exe"; DestDir: "{app}\data\bin"; Flags: ignoreversion
-Source: "deps\ffprobe.exe"; DestDir: "{app}\data\bin"; Flags: ignoreversion
+Source: "deps\ffmpeg.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: ignoreversion
+Source: "deps\ffprobe.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: ignoreversion
 ; latest yt-dlp downloaded to {tmp} during setup (below); copied if it succeeded
-Source: "{tmp}\yt-dlp.exe"; DestDir: "{app}\data\bin"; Flags: external ignoreversion skipifsourcedoesntexist
+Source: "{tmp}\yt-dlp.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: external ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -56,9 +56,6 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; remove app data (deps, profile, config, history) that the app wrote beside itself
-Type: filesandordirs; Name: "{app}\data"
 
 [Code]
 // Fetch the latest yt-dlp into {tmp} right before files are copied. Works in
