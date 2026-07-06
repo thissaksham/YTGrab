@@ -1093,13 +1093,6 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   padding-left:5px;border-left:0.5px solid var(--line2);margin-left:4px;}
 .save button:hover{color:var(--actx);}
 .lbl{font-size:11px;letter-spacing:.8px;color:var(--dim);}
-.tabs{display:flex;gap:4px;}
-.tab{background:none;border:none;color:var(--mut);font:500 13px/1 inherit;cursor:pointer;
-  padding:8px 14px;border-radius:9px;transition:background .14s,color .14s;}
-.tab:hover{color:var(--tx);}
-.tab.on{color:var(--tx);background:var(--s2);}
-#grid.show-active .gc.done{display:none;}
-#grid.show-hist .gc:not(.done){display:none;}
 #grid{flex:1;min-height:0;overflow-y:auto;display:grid;
   grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;align-content:start;padding:1px;}
 .empty{grid-column:1/-1;min-height:220px;display:flex;flex-direction:column;align-items:center;
@@ -1242,10 +1235,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
     stroke-linecap="round" stroke-linejoin="round"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>
   <b id="dir"></b><button onclick="pickDir()">Change</button></div>
 
-<div class="tabs">
-  <button id="tab-active" class="tab" onclick="switchTab('active')">Downloads</button>
-  <button id="tab-hist" class="tab on" onclick="switchTab('hist')">History</button>
-</div>
+<div><span class="lbl">DOWNLOADS</span></div>
 
 <div id="grid">
   <div class="empty" id="empty">
@@ -1349,23 +1339,10 @@ function lineClass(t){
   return"";
 }
 function setStat(el,label,cls){el.className="stat "+cls;el.innerHTML='<span class="dot"></span>'+label;}
-var curTab="hist";
-function switchTab(name){
-  curTab=name;
-  gridEl.className=name==="active"?"show-active":"show-hist";
-  document.getElementById("tab-active").classList.toggle("on",name==="active");
-  document.getElementById("tab-hist").classList.toggle("on",name==="hist");
-  refreshView();
-}
 function refreshView(){
-  var done=gridEl.querySelectorAll(".gc.done").length;
   var total=gridEl.querySelectorAll(".gc").length;
-  var count=curTab==="hist"?done:(total-done);
   var e=document.getElementById("empty");
-  if(!e)return;
-  if(count===0){e.style.display="flex";
-    e.querySelector("span").textContent=curTab==="hist"?"Nothing downloaded yet":"Nothing downloading right now";}
-  else{e.style.display="none";}
+  if(e)e.style.display=total===0?"flex":"none";
 }
 function subHtml(o){
   if(o.status==="done"){
@@ -1526,7 +1503,6 @@ function confirmDl(){
   if(dlMode==="auto")fmt=autoFmt();
   else{var sel=document.querySelector("#vlist .qrow.on");fmt=sel?sel.getAttribute("data-fmt"):"bv*+ba/b";}
   closeDlg();
-  switchTab("active");
   pywebview.api.start_download(pendingUrl,"custom",fmt,
     document.getElementById("plstart").value,document.getElementById("plend").value,
     document.getElementById("ck-watched").checked,document.getElementById("ck-stamp").checked,
@@ -1544,7 +1520,6 @@ document.addEventListener("keydown",function(e){
 });
 window.addEventListener("pywebviewready",function(){
   logEl=document.getElementById("log");gridEl=document.getElementById("grid");
-  switchTab("hist");
   document.getElementById("url").focus();
   pywebview.api.get_state().then(function(s){
     ui.setState(s);
