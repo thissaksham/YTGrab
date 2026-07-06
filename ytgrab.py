@@ -1269,7 +1269,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
     <div class="field">
       <span class="slabel">VIDEO FORMAT</span>
       <div class="fseg" id="vfmtseg">
-        <button class="fs on" data-v="quality" onclick="pickVfmt(this)"><span class="ft">Quality</span><span class="fd">AV1 / VP9 / H.265</span></button>
+        <button class="fs on" data-v="quality" onclick="pickVfmt(this)"><span class="ft">Quality</span><span class="fd">VP9 / AV1 / H.265</span></button>
         <button class="fs" data-v="legacy" onclick="pickVfmt(this)"><span class="ft">Legacy</span><span class="fd">H.264 · most compatible</span></button>
       </div>
     </div>
@@ -1434,10 +1434,12 @@ function pickVfmt(el){
 }
 function autoFmt(){
   var q=document.getElementById("vqual").value;
-  var cf=curVfmt==="legacy"?"[vcodec^=avc]":"[vcodec~='^(av01|vp0?9|hev1|hvc1)']";
-  if(q==="best")return "bv*"+cf+"+ba/bv*+ba/b";
   if(q==="lowest")return "wv*+ba/w";
-  return "bv*[height<="+q+"]"+cf+"+ba/bv*[height<="+q+"]+ba/b[height<="+q+"]";
+  var hc=q==="best"?"":"[height<="+q+"]";
+  var fb=q==="best"?"bv*+ba/b":"bv*[height<="+q+"]+ba/b[height<="+q+"]";
+  if(curVfmt==="legacy")return "bv*"+hc+"[vcodec^=avc]+ba/"+fb;
+  var cs=["[vcodec~='^vp0?9']","[vcodec~='^av01']","[vcodec~='^(hev1|hvc1)']"];
+  return cs.map(function(c){return "bv*"+hc+c+"+ba";}).join("/")+"/"+fb;
 }
 function genericV(){return [
   {label:"1080p",sub:"",size:"",fmt:"bv*[height<=1080]+ba/b[height<=1080]"},

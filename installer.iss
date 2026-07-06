@@ -4,7 +4,7 @@
 ; Build needs: dist\YTGrab\ (onedir), deps\ffmpeg.exe, deps\ffprobe.exe.
 ; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.3.2"
+#define AppVersion "1.3.3"
 #define AppExe "YTGrab.exe"
 
 [Setup]
