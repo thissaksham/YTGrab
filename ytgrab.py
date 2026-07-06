@@ -463,6 +463,68 @@ def fmt_label(info, path):
     return info.get("format_note") or ext or "?"
 
 
+def _short_codec(c):
+    if not c or c == "none":
+        return ""
+    c = c.lower()
+    for pre, name in (("vp9", "VP9"), ("vp09", "VP9"), ("av01", "AV1"), ("av1", "AV1"),
+                      ("avc", "H.264"), ("h264", "H.264"), ("hev", "HEVC"), ("h265", "HEVC"),
+                      ("opus", "Opus"), ("mp4a", "AAC"), ("aac", "AAC"), ("mp3", "MP3")):
+        if c.startswith(pre):
+            return name
+    return c.split(".")[0].upper()
+
+
+def _vrank(f):
+    """Sort key for choosing a video stream: prefer VP9, then AV1, then others,
+    highest bitrate within a codec. Matches the user's VP9 preference."""
+    vc = (f.get("vcodec") or "").lower()
+    pref = 0 if vc.startswith(("vp9", "vp09")) else 1 if vc.startswith(("av01", "av1")) else 2
+    return (pref, -(f.get("tbr") or 0))
+
+
+def build_vformats(data):
+    """Video formats for the custom picker; each pairs with best audio.
+    Video-only (DASH) streams preferred so audio is always the best track."""
+    try:
+        formats = data.get("formats") or []
+        auds = [f for f in formats if f.get("acodec") not in (None, "none")
+                and f.get("vcodec") in (None, "none")]
+        opus = [f for f in auds if "opus" in (f.get("acodec") or "").lower()]
+        best_aud = (max(opus, key=lambda f: (f.get("abr") or 0)) if opus
+                    else max(auds, key=lambda f: (f.get("abr") or 0), default=None))
+        aud_size = (best_aud.get("filesize") or best_aud.get("filesize_approx") or 0) if best_aud else 0
+        vids = [f for f in formats if f.get("height") and f.get("vcodec") not in (None, "none")
+                and f.get("acodec") in (None, "none")]
+        if not vids:
+            vids = [f for f in formats if f.get("height") and f.get("vcodec") not in (None, "none")]
+        if not vids:
+            return []
+        vids.sort(key=lambda f: (-(f.get("height") or 0), _vrank(f)))
+        out = []
+        for f in vids:
+            h = f.get("height")
+            vc = _short_codec(f.get("vcodec"))
+            fps = f.get("fps")
+            vid_only = f.get("acodec") in (None, "none")
+            vsize = f.get("filesize") or f.get("filesize_approx") or 0
+            size = vsize + (aud_size if vid_only else 0)
+            parts = []
+            if fps and fps >= 50:
+                parts.append(f"{int(round(fps))}fps")
+            if vc:
+                parts.append(vc)
+            if vid_only:
+                parts.append("Opus" if opus else _short_codec(best_aud.get("acodec")) if best_aud else "")
+            fid = f.get("format_id")
+            fmt = f"{fid}+ba/{fid}" if vid_only else fid
+            out.append({"label": f"{h}p", "sub": " · ".join([p for p in parts if p]),
+                        "size": ("~" + human_size(size)) if size else "", "fmt": fmt})
+        return out
+    except Exception:
+        return []
+
+
 def build_entry(info, target, vid):
     thumb = (f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
              if len(vid) == 11 else (info.get("thumbnail") or ""))
@@ -749,7 +811,8 @@ class Api:
                 "title": data.get("title") or "Unknown title",
                 "uploader": data.get("uploader") or data.get("channel") or "",
                 "duration": fmt_dur(dur) if dur else "",
-                "thumb": data.get("thumbnail") or ""}
+                "thumb": data.get("thumbnail") or "",
+                "vformats": build_vformats(data)}
 
     def list_formats(self, url):
         url = (url or "").strip()
@@ -999,550 +1062,518 @@ class Api:
 
 HTML = r"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
-:root {
-  color-scheme: dark;
-  --bg:#141218; --surf1:#1D1B20; --surf2:#211F26; --surf3:#2B2930;
-  --on:#E6E0E9; --onvar:#CAC4D0; --outline:#938F99; --outvar:#49454F;
-  --primary:#D0BCFF; --onprimary:#381E72; --seccont:#4A4458; --onseccont:#E8DEF8;
-  --green:#81C995; --red:#F2B8B5; --amber:#FFD8A8;
+:root{
+  color-scheme:dark;
+  --bg:#0E0E11; --s1:#141418; --s2:#17171B; --s3:#1C1C22;
+  --line:#232329; --line2:#2A2A31;
+  --tx:#EAEAF0; --mut:#8A8A94; --dim:#5E5E68;
+  --ac:#7D6FE8; --ac2:#8B79EE; --acbg:#221C3A; --actx:#C4B9F7;
+  --ok:#6BD6A8; --warn:#E7B968; --danger:#E8837D;
 }
-* { box-sizing:border-box; }
-body { margin:0; height:100vh; display:flex; flex-direction:column; gap:12px;
-  padding:14px 18px 18px; background:var(--bg); color:var(--on);
-  font:14px/1.5 Roboto,"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
-  -webkit-font-smoothing:antialiased; user-select:none; }
-svg { flex:none; }
-header { display:flex; align-items:center; gap:12px; padding:4px 2px; }
-header h1 { margin:0; font-size:22px; font-weight:400; letter-spacing:.1px; }
-.chip { height:28px; padding:0 12px; border-radius:8px; display:inline-flex;
-  align-items:center; gap:7px; font-size:12px; font-weight:500;
-  color:var(--onvar); border:1px solid var(--outvar); }
-.chip .dot { width:7px; height:7px; border-radius:50%; background:var(--outline); }
-.chip.ok { border-color:transparent; background:rgba(129,201,149,.14); color:var(--green); }
-.chip.ok .dot { background:var(--green); }
-.chip.warn { border-color:transparent; background:rgba(255,216,168,.14); color:var(--amber); }
-.chip.warn .dot { background:var(--amber); }
-.spacer { flex:1; }
-.btn { height:40px; padding:0 22px; border:none; border-radius:20px; cursor:pointer;
-  display:inline-flex; align-items:center; gap:8px; font:500 14px/1 inherit;
-  transition:filter .15s, background .15s, opacity .15s; }
-.btn:disabled { opacity:.38; cursor:default; }
-.btn:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-visible {
-  outline:2px solid var(--primary); outline-offset:2px; }
-.filled { background:var(--primary); color:var(--onprimary); }
-.filled:hover:not(:disabled) { filter:brightness(1.07); }
-.tonal { background:var(--seccont); color:var(--onseccont); }
-.tonal:hover:not(:disabled) { filter:brightness(1.12); }
-.textbtn { background:transparent; color:var(--primary); height:40px; padding:0 14px;
-  border:none; border-radius:20px; cursor:pointer; font:500 14px/1 inherit; }
-.textbtn:hover { background:rgba(208,188,255,.08); }
-.iconbtn { width:40px; height:40px; border:none; border-radius:50%; cursor:pointer;
-  background:transparent; color:var(--onvar); display:inline-flex;
-  align-items:center; justify-content:center; transition:background .15s; }
-.iconbtn:hover { background:rgba(230,224,233,.08); }
-input[type=text], input[type=number] { padding:10px 14px; font:13.5px/1.4 inherit;
-  color:var(--on); background:var(--surf3); border:1px solid transparent;
-  border-radius:10px; transition:border-color .15s; }
-input:focus { border-color:var(--primary); outline:none; }
-input::placeholder { color:#8F8A96; }
-select { appearance:none; -webkit-appearance:none; padding:10px 36px 10px 14px;
-  font:500 13px/1.2 inherit; color:var(--on); cursor:pointer; border:none;
-  border-radius:10px;
-  background:var(--surf3) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23CAC4D0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>")
-    no-repeat right 12px center; }
-.card { background:var(--surf2); border-radius:16px; padding:14px 16px;
-  display:flex; flex-direction:column; gap:10px; }
-.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-#url { flex:1; min-width:260px; }
-.dim { color:var(--onvar); font-size:12.5px; }
-.path { font-size:12.5px; color:var(--primary); overflow:hidden;
-  text-overflow:ellipsis; white-space:nowrap; max-width:430px; }
-#listhead { display:flex; align-items:center; gap:8px; padding:0 4px; }
-#listhead .t { font-size:12.5px; font-weight:600; color:var(--onvar);
-  text-transform:uppercase; letter-spacing:.6px; }
-#queue { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column;
-  gap:8px; padding:2px; }
-.empty { flex:1; display:flex; flex-direction:column; align-items:center;
-  justify-content:center; gap:12px; color:#8F8A96;
-  border:1.5px dashed var(--outvar); border-radius:16px; }
-.empty svg { opacity:.45; }
-.empty span { font-size:13px; }
-.qcard { display:flex; gap:12px; align-items:center; padding:10px 12px; flex:none;
-  background:var(--surf2); border-radius:16px; transition:background .15s; }
-.qcard.playable { cursor:pointer; }
-.qcard.playable:hover { background:var(--surf3); }
-.qcard.missing { opacity:.5; }
-.qthumb { width:100px; height:56px; border-radius:10px; object-fit:cover;
-  background:var(--surf3); flex:none; position:relative; }
-.qbody { flex:1; min-width:0; display:flex; flex-direction:column; gap:6px; }
-.qtitle { font-size:13.5px; font-weight:500; white-space:nowrap; overflow:hidden;
-  text-overflow:ellipsis; }
-.qmeta { font-size:11.5px; color:var(--onvar); font-variant-numeric:tabular-nums;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.qpath { display:none; font-size:11px; color:#79747E; white-space:nowrap;
-  overflow:hidden; text-overflow:ellipsis; direction:rtl; text-align:left;
-  user-select:text; }
-.qbar { height:4px; border-radius:2px; background:var(--outvar); overflow:hidden; }
-.qbar i { display:block; height:100%; width:0; border-radius:2px;
-  background:var(--primary); transition:width .3s ease-out; }
-.qcard.done .qbar, .qcard.failed .qbar, .qcard.queued .qbar { display:none; }
-.qcard.processing .qbar i { background:#CCC2DC; }
-.qstate { flex:none; width:26px; height:26px; display:flex; align-items:center;
-  justify-content:center; }
-.spin { width:15px; height:15px; border-radius:50%;
-  border:2px solid var(--outvar); border-top-color:var(--primary);
-  animation:spin .8s linear infinite; }
-@keyframes spin { to { transform:rotate(360deg); } }
-.okmark { color:var(--green); } .badmark { color:var(--red); }
-.qdel, .qfolder { display:none; flex:none; width:34px; height:34px; border:none;
-  border-radius:50%; background:transparent; color:var(--onvar); cursor:pointer;
-  align-items:center; justify-content:center; transition:background .15s, color .15s; }
-.qdel:hover { background:rgba(242,184,181,.14); color:var(--red); }
-.qfolder:hover { background:rgba(208,188,255,.14); color:var(--primary); }
-.console { flex:none; background:var(--surf1); border-radius:16px; overflow:hidden; }
-.console-head { display:flex; align-items:center; gap:9px; padding:11px 16px;
-  cursor:pointer; color:var(--onvar); font-size:12.5px; font-weight:500; }
-.console-head:hover { color:var(--on); }
-.chev { transition:transform .2s; }
-.console.open .chev { transform:rotate(90deg); }
-#log { display:none; height:150px; overflow-y:auto; padding:4px 16px 12px;
-  border-top:1px solid var(--outvar); white-space:pre-wrap; user-select:text;
-  font:12px/1.65 "Cascadia Mono",Consolas,monospace; color:#A8A2B0; }
-.console.open #log { display:block; }
-#log .c-green { color:var(--green); } #log .c-red { color:var(--red); }
-#log .c-blue { color:#A8C7FA; } #log .c-pink { color:var(--primary); }
-#log .c-dim { color:#79747E; }
-#scrim { position:fixed; inset:0; background:rgba(0,0,0,.5); opacity:0;
-  pointer-events:none; transition:opacity .2s; z-index:9; }
-#scrim.open { opacity:1; pointer-events:auto; }
-#sheet { position:fixed; left:50%; bottom:0; transform:translate(-50%,105%);
-  width:min(580px,94vw); max-height:86vh; overflow-y:auto;
-  background:var(--surf2); border-radius:28px 28px 0 0; padding:6px 24px 20px;
-  transition:transform .25s cubic-bezier(.2,0,0,1); z-index:10;
-  display:flex; flex-direction:column; gap:14px; }
-#sheet.open { transform:translate(-50%,0); }
-.handle { width:32px; height:4px; border-radius:2px; background:var(--outvar);
-  margin:8px auto 2px; flex:none; }
-.media { display:flex; gap:14px; align-items:center; }
-#s-thumb { width:128px; height:72px; border-radius:12px; object-fit:cover;
-  background:var(--surf3); flex:none; }
-#s-title { font-size:15px; font-weight:500; line-height:1.35; display:-webkit-box;
-  -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
-.msub { font-size:12.5px; color:var(--onvar); margin-top:4px; }
-.srow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-.slabel { font-size:13px; font-weight:500; color:var(--onvar); min-width:52px; }
-#customfmt { width:220px; display:none; }
-#customfmt.active { display:inline-block; }
-#plrow { display:none; }
-#plrow.show { display:flex; }
-#plrow input { width:86px; }
-.ck { display:inline-flex; align-items:center; gap:9px; font-size:13px;
-  color:var(--onvar); cursor:pointer; user-select:none; }
-.ck input { width:18px; height:18px; accent-color:var(--primary); cursor:pointer; }
-#fmtout { display:none; max-height:170px; overflow:auto; margin:0;
-  padding:10px 12px; border-radius:12px; background:var(--surf1);
-  white-space:pre; user-select:text;
-  font:11.5px/1.55 "Cascadia Mono",Consolas,monospace; color:#B7B0C0; }
-.sactions { display:flex; gap:8px; align-items:center; }
-::-webkit-scrollbar { width:10px; height:10px; }
-::-webkit-scrollbar-thumb { background:rgba(255,255,255,.12); border-radius:5px;
-  border:2px solid transparent; background-clip:content-box; }
-::-webkit-scrollbar-track { background:transparent; }
-@media (prefers-reduced-motion: reduce) {
-  * { transition:none !important; animation:none !important; }
-}
+*{box-sizing:border-box;}
+body{margin:0;height:100vh;display:flex;flex-direction:column;gap:15px;
+  padding:16px 20px 16px;background:var(--bg);color:var(--tx);
+  font:14px/1.5 Inter,"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;user-select:none;}
+svg{flex:none;}
+header{display:flex;align-items:center;gap:13px;}
+header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
+.stat{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);}
+.stat .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);}
+.stat.ok .dot{background:var(--ok);}
+.stat.warn .dot{background:var(--warn);}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);}
+.chip .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);}
+.chip.ok .dot{background:var(--ok);} .chip.warn .dot{background:var(--warn);}
+.sp{flex:1;}
+.ib{width:34px;height:34px;border-radius:9px;border:0.5px solid var(--line2);background:transparent;
+  color:var(--mut);display:inline-flex;align-items:center;justify-content:center;
+  cursor:pointer;transition:background .14s,color .14s;}
+.ib:hover{background:var(--s2);color:var(--tx);}
+.inrow{display:flex;gap:10px;}
+#url{flex:1;min-width:0;height:48px;border:0.5px solid var(--line2);border-radius:13px;
+  background:var(--s2);color:var(--tx);padding:0 17px;font:14.5px/1 inherit;transition:border-color .14s;}
+#url:focus{outline:none;border-color:var(--ac);}
+#url::placeholder{color:var(--dim);}
+.btn{height:48px;border:none;border-radius:13px;cursor:pointer;display:inline-flex;align-items:center;
+  gap:8px;font:600 14px/1 inherit;transition:filter .14s,opacity .14s,background .14s;}
+.btn:disabled{opacity:.4;cursor:default;}
+.btn.dl{padding:0 24px;background:var(--ac);color:#fff;}
+.btn.dl:hover:not(:disabled){filter:brightness(1.08);}
+.btn.cancel{display:none;padding:0 18px;background:var(--s3);color:var(--mut);}
+.btn.cancel:hover:not(:disabled){background:#24242B;color:var(--tx);}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px;}
+.save{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--mut);
+  align-self:flex-start;padding:6px 12px;border-radius:9px;background:var(--s1);border:0.5px solid var(--line);}
+.save .fi{color:var(--dim);}
+.save b{color:var(--tx);font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px;}
+.save button{background:none;border:none;color:var(--ac2);font:500 12.5px/1 inherit;cursor:pointer;
+  padding-left:5px;border-left:0.5px solid var(--line2);margin-left:4px;}
+.save button:hover{color:var(--actx);}
+.lbl{font-size:11px;letter-spacing:.8px;color:var(--dim);}
+.tabs{display:flex;gap:4px;}
+.tab{background:none;border:none;color:var(--mut);font:500 13px/1 inherit;cursor:pointer;
+  padding:8px 14px;border-radius:9px;transition:background .14s,color .14s;}
+.tab:hover{color:var(--tx);}
+.tab.on{color:var(--tx);background:var(--s2);}
+#grid.show-active .gc.done{display:none;}
+#grid.show-hist .gc:not(.done){display:none;}
+#grid{flex:1;min-height:0;overflow-y:auto;display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;align-content:start;padding:1px;}
+.empty{grid-column:1/-1;min-height:220px;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:12px;color:var(--dim);border:1px dashed var(--line2);border-radius:14px;}
+.empty svg{opacity:.5;}
+.empty span{font-size:13px;}
+.gc{background:var(--s1);border:0.5px solid var(--line);border-radius:13px;overflow:hidden;}
+.gc.playable{cursor:pointer;}
+.gc.playable:hover{border-color:var(--line2);}
+.gc.missing{opacity:.5;}
+.gth{position:relative;aspect-ratio:16/9;background:var(--s3);display:flex;align-items:center;
+  justify-content:center;overflow:hidden;}
+.gimg{width:100%;height:100%;object-fit:cover;}
+.gph{position:absolute;color:#3A3A42;}
+.gbadge{position:absolute;top:7px;right:7px;font-size:10.5px;font-weight:500;
+  background:rgba(8,8,10,.72);color:#D6D6DE;padding:2px 7px;border-radius:6px;}
+.gprog{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(0,0,0,.4);display:none;}
+.gprog i{display:block;height:100%;width:0;background:var(--ac);transition:width .3s ease-out;}
+.gc.downloading .gprog,.gc.processing .gprog{display:block;}
+.gc.processing .gprog i{background:#B9A8F5;}
+.gplay{position:absolute;width:42px;height:42px;border-radius:50%;background:rgba(8,8,10,.55);
+  color:#fff;display:none;align-items:center;justify-content:center;}
+.gc.done.playable:hover .gplay{display:flex;}
+.gacts{position:absolute;top:6px;left:6px;display:none;gap:5px;}
+.gc.done:hover .gacts{display:flex;}
+.ga{width:28px;height:28px;border-radius:8px;border:none;background:rgba(8,8,10,.72);color:#D6D6DE;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;}
+.ga:hover{background:rgba(8,8,10,.92);color:#fff;}
+.ga.gdel:hover{color:var(--danger);}
+.gm{padding:9px 11px 11px;}
+.gt{font-size:12.5px;font-weight:500;line-height:1.35;margin-bottom:5px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:34px;}
+.gs{font-size:11px;color:var(--mut);display:flex;align-items:center;gap:5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.gs .ok{color:var(--ok);} .gs .bad{color:var(--danger);}
+.gs .spin{width:11px;height:11px;border:2px solid var(--line2);border-top-color:var(--ac);
+  border-radius:50%;animation:spin .8s linear infinite;flex:none;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.console{background:var(--s1);border:0.5px solid var(--line);border-radius:12px;overflow:hidden;flex:none;}
+.chead{display:flex;align-items:center;gap:9px;padding:10px 14px;cursor:pointer;
+  color:var(--mut);font-size:12px;font-weight:500;}
+.chead:hover{color:var(--tx);}
+.chev{transition:transform .2s;}
+.console.open .chev{transform:rotate(90deg);}
+#log{display:none;height:140px;overflow-y:auto;padding:2px 14px 12px;white-space:pre-wrap;user-select:text;
+  border-top:0.5px solid var(--line);font:11.5px/1.6 "Cascadia Mono",Consolas,monospace;color:#9A9AA4;}
+.console.open #log{display:block;}
+#log .g{color:var(--ok);} #log .r{color:var(--danger);} #log .b{color:#A8C7FA;}
+#log .p{color:var(--ac2);} #log .d{color:#57575F;}
+#scrim{position:fixed;inset:0;background:rgba(0,0,0,.6);opacity:0;pointer-events:none;
+  transition:opacity .18s;z-index:9;}
+#scrim.open{opacity:1;pointer-events:auto;}
+#dlg{position:fixed;left:50%;top:50%;transform:translate(-50%,-46%);opacity:0;pointer-events:none;
+  width:min(500px,92vw);max-height:88vh;overflow-y:auto;background:var(--s2);border:0.5px solid var(--line2);
+  border-radius:18px;padding:22px;z-index:10;display:flex;flex-direction:column;gap:17px;
+  transition:opacity .18s,transform .18s;box-shadow:0 24px 60px rgba(0,0,0,.5);}
+#dlg.open{opacity:1;pointer-events:auto;transform:translate(-50%,-50%);}
+.media{display:flex;gap:14px;align-items:center;}
+#s-thumb{width:126px;height:71px;border-radius:11px;object-fit:cover;background:var(--s3);flex:none;}
+#s-title{font-size:15px;font-weight:500;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden;}
+.msub{font-size:12px;color:var(--mut);margin-top:4px;}
+.field{display:flex;flex-direction:column;gap:9px;}
+.slabel{font-size:11px;letter-spacing:.6px;color:var(--dim);}
+.qlist{display:flex;flex-direction:column;gap:5px;max-height:264px;overflow-y:auto;}
+.qload{padding:16px;text-align:center;color:var(--dim);font-size:12.5px;}
+.qrow{display:flex;align-items:center;gap:10px;width:100%;padding:11px 13px;border-radius:11px;
+  border:0.5px solid var(--line2);background:var(--s3);cursor:pointer;text-align:left;
+  transition:background .12s,border-color .12s;}
+.qrow:hover{background:#20202A;}
+.qrow.on{border-color:var(--ac);background:var(--acbg);}
+.qmain{font:500 13.5px/1 inherit;color:var(--tx);min-width:78px;flex:none;}
+.qrow.on .qmain{color:var(--actx);}
+.qsub{flex:1;font-size:11.5px;color:var(--mut);}
+.qsize{font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums;flex:none;}
+.qck{color:var(--ac2);opacity:0;flex:none;display:flex;}
+.qrow.on .qck{opacity:1;}
+.modeseg{display:flex;gap:4px;background:var(--s3);border-radius:12px;padding:4px;}
+.ms{flex:1;height:36px;border:none;border-radius:9px;background:transparent;color:var(--mut);
+  font:500 13px/1 inherit;cursor:pointer;transition:background .14s,color .14s;}
+.ms:hover{color:var(--tx);}
+.ms.on{background:var(--ac);color:#fff;}
+#autopane{display:flex;flex-direction:column;gap:15px;}
+#custompane{display:none;flex-direction:column;gap:15px;}
+.fseg{display:flex;gap:8px;}
+.fs{flex:1;min-height:54px;padding:9px 13px;border-radius:11px;border:0.5px solid var(--line2);
+  background:var(--s3);color:var(--mut);cursor:pointer;display:flex;flex-direction:column;
+  align-items:flex-start;gap:4px;transition:background .14s,color .14s,border-color .14s;}
+.fs:hover{color:var(--tx);}
+.fs .ft{font:500 13px/1 inherit;}
+.fs .fd{font:400 11px/1.2 inherit;color:var(--dim);}
+.fs.on{background:var(--acbg);color:var(--actx);border-color:transparent;}
+.fs.on .fd{color:#A79BDA;}
+#vqual{height:42px;border:0.5px solid var(--line2);border-radius:10px;background:var(--s3);
+  color:var(--tx);font:13px/1 inherit;padding:0 34px 0 14px;cursor:pointer;
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%238A8A94' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat;background-position:right 12px center;}
+#plrow{display:none;flex-direction:column;gap:9px;}
+#plrow.on{display:flex;}
+.plinputs{display:flex;gap:9px;align-items:center;}
+#plstart,#plend{height:40px;width:92px;border:0.5px solid var(--line2);border-radius:10px;
+  background:var(--s3);color:var(--tx);font:13px/1 inherit;padding:0 13px;}
+.opts{display:flex;flex-direction:column;gap:11px;}
+.ck{display:inline-flex;align-items:center;gap:9px;font-size:13px;color:var(--mut);cursor:pointer;}
+.ck input{width:17px;height:17px;accent-color:var(--ac);cursor:pointer;}
+.sact{display:flex;gap:8px;align-items:center;margin-top:2px;}
+.tbtn{background:none;border:none;color:var(--mut);font:500 13px/1 inherit;cursor:pointer;
+  height:40px;padding:0 16px;border-radius:10px;}
+.tbtn:hover{background:var(--s1);color:var(--tx);}
+::-webkit-scrollbar{width:9px;height:9px;}
+::-webkit-scrollbar-thumb{background:#2C2C33;border-radius:5px;border:2px solid transparent;background-clip:content-box;}
+::-webkit-scrollbar-track{background:transparent;}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important;}}
 </style></head><body>
 
 <header>
   <h1>YTGrab</h1>
-  <span id="deps" class="chip"><span class="dot"></span>checking deps</span>
-  <span id="auth" class="chip"><span class="dot"></span>login</span>
-  <span class="spacer"></span>
-  <button class="iconbtn" aria-label="Update dependencies" title="Update yt-dlp and ffmpeg"
-          onclick="pywebview.api.update_deps()">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
-  <button class="iconbtn" id="loginbtn" aria-label="Login"
-          title="Log into the pasted URL's site (YouTube if empty)"
-          onclick="pywebview.api.login(document.getElementById('url').value)">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/></svg></button>
+  <span id="deps" class="stat"><span class="dot"></span>checking deps</span>
+  <span id="auth" class="stat"><span class="dot"></span>login</span>
+  <span class="sp"></span>
+  <button class="ib" id="loginbtn" title="Log into the pasted URL's site (YouTube if empty)"
+          aria-label="Login" onclick="pywebview.api.login(document.getElementById('url').value)">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/></svg>
+  </button>
 </header>
 
-<section class="card">
-  <div class="row">
-    <input type="text" id="url" placeholder="Paste a video, playlist or channel link"
-           spellcheck="false">
-    <button class="btn filled" id="dl" onclick="startDl()">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
-      <span id="dlLabel">Download</span></button>
-    <button class="btn tonal" id="cancel" onclick="pywebview.api.cancel()" disabled>
-      Cancel</button>
-  </div>
-  <div class="row">
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-         style="color:#8F8A96">
-      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-    <span class="dim">Save to</span>
-    <span id="dir" class="path"></span>
-    <button class="textbtn" onclick="pickDir()">Change</button>
-  </div>
-</section>
+<div class="inrow">
+  <input type="text" id="url" placeholder="Paste a video, playlist or channel link" spellcheck="false">
+  <button class="btn dl" id="dl" onclick="startDl()">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+      stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+    <span id="dlLabel">Download</span></button>
+  <button class="btn cancel" id="cancel" onclick="pywebview.api.cancel()">Cancel</button>
+</div>
 
-<div id="listhead"><span class="t">Downloads</span><span class="spacer"></span>
-  <span class="dim" style="font-size:11px">double-click a finished item to play</span></div>
+<div class="save">
+  <svg class="fi" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+    stroke-linecap="round" stroke-linejoin="round"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>
+  <b id="dir"></b><button onclick="pickDir()">Change</button></div>
 
-<div id="queue">
+<div class="tabs">
+  <button id="tab-active" class="tab" onclick="switchTab('active')">Downloads</button>
+  <button id="tab-hist" class="tab on" onclick="switchTab('hist')">History</button>
+</div>
+
+<div id="grid">
   <div class="empty" id="empty">
-    <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
-    <span>Paste a link above &mdash; downloads appear here</span>
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+      stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+    <span>Paste a link above &mdash; your videos appear here</span>
   </div>
 </div>
 
-<section class="card console" id="console" style="padding:0">
-  <div class="console-head" onclick="toggleConsole()">
-    <svg class="chev" width="13" height="13" viewBox="0 0 24 24" fill="none"
-         stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
-         stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
-    Console
-    <span class="spacer"></span>
+<div class="console" id="console">
+  <div class="chead" onclick="document.getElementById('console').classList.toggle('open')">
+    <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+      stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>Console
+    <span class="sp"></span>
     <span id="counts" class="chip"><span class="dot"></span>ok 0 &middot; failed 0</span>
   </div>
   <div id="log"></div>
-</section>
+</div>
 
-<div id="scrim" onclick="closeSheet()"></div>
-<div id="sheet" role="dialog" aria-modal="true" aria-label="Download options">
-  <div class="handle"></div>
+<div id="scrim" onclick="closeDlg()"></div>
+<div id="dlg" role="dialog" aria-modal="true" aria-label="Download options">
   <div class="media">
     <img id="s-thumb" alt="">
-    <div style="min-width:0">
-      <div id="s-title">&hellip;</div>
-      <div id="s-sub" class="msub"></div>
+    <div style="min-width:0"><div id="s-title">&hellip;</div><div id="s-sub" class="msub"></div></div>
+  </div>
+  <div class="modeseg" id="modeseg">
+    <button class="ms on" data-m="auto" onclick="switchMode('auto')">Auto</button>
+    <button class="ms" data-m="custom" onclick="switchMode('custom')">Custom</button>
+  </div>
+  <div id="autopane">
+    <div class="field">
+      <span class="slabel">VIDEO FORMAT</span>
+      <div class="fseg" id="vfmtseg">
+        <button class="fs on" data-v="quality" onclick="pickVfmt(this)"><span class="ft">Quality</span><span class="fd">AV1 / VP9 / H.265</span></button>
+        <button class="fs" data-v="legacy" onclick="pickVfmt(this)"><span class="ft">Legacy</span><span class="fd">H.264 · most compatible</span></button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="slabel">VIDEO QUALITY</span>
+      <select id="vqual">
+        <option value="best">Best quality</option>
+        <option value="2160">2160p (4K)</option>
+        <option value="1440">1440p</option>
+        <option value="1080" selected>1080p</option>
+        <option value="720">720p</option>
+        <option value="480">480p</option>
+        <option value="360">360p</option>
+        <option value="lowest">Lowest quality</option>
+      </select>
+    </div>
+    <span class="msub">Audio is always the best available track.</span>
+  </div>
+  <div id="custompane">
+    <div class="field">
+      <span class="slabel">CHOOSE A VIDEO — audio is always best</span>
+      <div class="qlist" id="vlist"><div class="qload">Loading formats…</div></div>
     </div>
   </div>
-  <div class="srow">
-    <span class="slabel">Quality</span>
-    <select id="quality" aria-label="Quality" onchange="qualityChanged()">
-      <option value="default" selected>Default &middot; 720&ndash;1080 VP9</option>
-      <option value="bv*+ba/b">Best available</option>
-      <option value="bv*[height<=2160]+ba/b[height<=2160]">4K &middot; 2160p</option>
-      <option value="bv*[height<=1440]+ba/b[height<=1440]">1440p</option>
-      <option value="bv*[height<=1080]+ba/b[height<=1080]">1080p</option>
-      <option value="bv*[height<=720]+ba/b[height<=720]">720p</option>
-      <option value="bv*[height<=480]+ba/b[height<=480]">480p</option>
-      <option value="ba[ext=m4a]/ba">Audio only</option>
-      <option value="custom">Custom selector&hellip;</option>
-    </select>
-    <input type="text" id="customfmt" placeholder="e.g. 137+140 or bv+ba" spellcheck="false">
+  <div class="field" id="plrow">
+    <span class="slabel">PLAYLIST RANGE</span>
+    <div class="plinputs">
+      <input type="number" id="plstart" min="1" placeholder="start">
+      <input type="number" id="plend" min="1" placeholder="end">
+      <span class="msub">blank = all</span>
+    </div>
   </div>
-  <div class="srow" id="plrow">
-    <span class="slabel">Range</span>
-    <input type="number" id="plstart" min="1" placeholder="start">
-    <input type="number" id="plend" min="1" placeholder="end">
-    <span class="msub">blank = all</span>
+  <div class="opts">
+    <label class="ck"><input type="checkbox" id="ck-watched" checked>Mark as watched</label>
+    <label class="ck"><input type="checkbox" id="ck-stamp" checked>Set file date to upload date</label>
   </div>
-  <div class="srow">
-    <label class="ck"><input type="checkbox" id="ck-watched" checked>
-      Mark as watched</label>
-    <label class="ck"><input type="checkbox" id="ck-stamp" checked>
-      Set file date to upload date</label>
-  </div>
-  <pre id="fmtout"></pre>
-  <div class="sactions">
-    <button class="textbtn" onclick="sheetFormats()">Formats</button>
-    <span class="spacer"></span>
-    <button class="textbtn" onclick="closeSheet()">Cancel</button>
-    <button class="btn filled" id="s-go" onclick="confirmDl()">Download</button>
+  <div class="sact">
+    <span class="sp"></span>
+    <button class="tbtn" onclick="closeDlg()">Cancel</button>
+    <button class="btn dl" id="s-go" onclick="confirmDl()" style="height:42px;padding:0 22px;font-size:13.5px">Download</button>
   </div>
 </div>
 
 <script>
-var okCount = 0, failCount = 0, lastProg = null;
-var logEl, pendingUrl = null, lastInfo = null;
-var cards = {};
-var STATUS_LABEL = { fetching:"Fetching info", downloading:"Downloading",
-                     processing:"Processing", done:"Completed", failed:"Failed",
-                     queued:"Queued" };
-var ICON_OK = '<svg class="okmark" width="18" height="18" viewBox="0 0 24 24" fill="none"' +
-  ' stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M20 6 9 17l-5-5"/></svg>';
-var ICON_BAD = '<svg class="badmark" width="18" height="18" viewBox="0 0 24 24" fill="none"' +
-  ' stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
-var ICON_CLOCK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none"' +
-  ' stroke="#938F99" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-  '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
-var ICON_TRASH = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"' +
-  ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/>' +
-  '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
-var ICON_FOLDER = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none"' +
-  ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>';
-
-function toggleConsole() { document.getElementById("console").classList.toggle("open"); }
-function lineClass(t) {
-  if (t.indexOf("[+]") === 0) return "c-green";
-  if (t.indexOf("[!]") === 0 || t.indexOf("ERROR") === 0) return "c-red";
-  if (t.indexOf("[post]") === 0) return "c-blue";
-  if (t.indexOf("[*]") === 0) return "c-pink";
-  if (t.indexOf("[deps]") === 0 || t.indexOf("[login]") === 0) return "c-dim";
-  return "";
+var okCount=0,failCount=0,lastProg=null,logEl,gridEl,pendingUrl=null,lastInfo=null,defaultFmt="";
+var dlMode="auto",curVfmt="quality";
+var cards={};
+var LABEL={fetching:"Fetching info",downloading:"Downloading",processing:"Processing",
+           done:"Completed",failed:"Failed",queued:"Queued"};
+var P={
+ folder:'<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/>',
+ trash:'<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>',
+ check:'<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-4.5"/>',
+ clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+ alert:'<path d="M12 3 2 20h20z"/><path d="M12 10v4"/><path d="M12 17h.01"/>'
+};
+function ic(n,sz,cls){return '<svg class="'+(cls||'')+'" width="'+(sz||16)+'" height="'+(sz||16)+
+  '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';}
+function play(sz){return '<svg width="'+(sz||20)+'" height="'+(sz||20)+
+  '" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';}
+function lineClass(t){
+  if(t.indexOf("[+]")===0)return"g";
+  if(t.indexOf("[!]")===0||t.indexOf("ERROR")===0)return"r";
+  if(t.indexOf("[post]")===0)return"b";
+  if(t.indexOf("[*]")===0)return"p";
+  if(t.indexOf("[deps]")===0||t.indexOf("[login]")===0)return"d";
+  return"";
 }
-function setChip(el, label, cls) {
-  el.className = "chip " + cls;
-  el.innerHTML = '<span class="dot"></span>' + label;
+function setStat(el,label,cls){el.className="stat "+cls;el.innerHTML='<span class="dot"></span>'+label;}
+var curTab="hist";
+function switchTab(name){
+  curTab=name;
+  gridEl.className=name==="active"?"show-active":"show-hist";
+  document.getElementById("tab-active").classList.toggle("on",name==="active");
+  document.getElementById("tab-hist").classList.toggle("on",name==="hist");
+  refreshView();
 }
-function updateEmpty() {
-  var q = document.getElementById("queue");
-  var has = q.querySelector(".qcard");
-  var e = document.getElementById("empty");
-  if (has && e) e.remove();
-  if (!has && !e) {
-    var d = document.createElement("div");
-    d.className = "empty"; d.id = "empty";
-    d.innerHTML = '<svg width="42" height="42" viewBox="0 0 24 24" fill="none"' +
-      ' stroke="currentColor" stroke-width="1.6" stroke-linecap="round"' +
-      ' stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/>' +
-      '<path d="M4 21h16"/></svg><span>Paste a link above &mdash; downloads appear here</span>';
-    q.appendChild(d);
+function refreshView(){
+  var done=gridEl.querySelectorAll(".gc.done").length;
+  var total=gridEl.querySelectorAll(".gc").length;
+  var count=curTab==="hist"?done:(total-done);
+  var e=document.getElementById("empty");
+  if(!e)return;
+  if(count===0){e.style.display="flex";
+    e.querySelector("span").textContent=curTab==="hist"?"Nothing downloaded yet":"Nothing downloading right now";}
+  else{e.style.display="none";}
+}
+function subHtml(o){
+  if(o.status==="done"){
+    var mark=o.exists===false?ic('alert',13,'bad'):ic('check',13,'ok');
+    var parts=[o.size,o.format].filter(Boolean).join(" · ")||o.channel||"Completed";
+    return mark+"<span>"+parts+"</span>";
   }
-}
-function metaText(o) {
-  if (o.status === "done")
-    return [o.channel, o.duration, o.size, o.format].filter(Boolean).join(" · ")
-           || "Completed";
-  if (o.status === "downloading") {
-    var p = [o.phase || "Downloading"];
-    if (o.pct != null) p.push(Math.round(o.pct) + "%");
-    if (o.speed) p.push(o.speed);
-    if (o.eta) p.push("ETA " + o.eta);
-    return p.join(" · ");
+  if(o.status==="failed")return ic('alert',13,'bad')+"<span>Failed</span>";
+  if(o.status==="downloading"){
+    var p=[o.phase||"Downloading"];if(o.speed)p.push(o.speed);
+    return '<span class="spin"></span><span>'+p.join(" · ")+"</span>";
   }
-  if (o.status === "processing") return o.phase || "Processing";
-  return o.phase || STATUS_LABEL[o.status] || o.status || "";
+  if(o.status==="queued")return ic('clock',12)+"<span>Queued</span>";
+  return '<span class="spin"></span><span>'+(o.phase||LABEL[o.status]||"")+"</span>";
 }
-function makeCard(key) {
-  var el = document.createElement("div");
-  el.className = "qcard"; el.id = "q-" + key;
-  el.innerHTML =
-    '<img class="qthumb" style="display:none" alt="">' +
-    '<div class="qbody"><div class="qtitle">…</div>' +
-    '<div class="qmeta"></div><div class="qpath"></div><div class="qbar"><i></i></div></div>' +
-    '<div class="qstate"></div>' +
-    '<button class="qfolder" title="Open containing folder">' + ICON_FOLDER + '</button>' +
-    '<button class="qdel" title="Remove from list">' + ICON_TRASH + '</button>';
-  el.addEventListener("dblclick", function () {
-    if (cards[key] && cards[key].path) pywebview.api.play(key);
-  });
-  el.querySelector(".qfolder").addEventListener("click", function (ev) {
-    ev.stopPropagation();
-    pywebview.api.reveal(key);
-  });
-  el.querySelector(".qdel").addEventListener("click", function (ev) {
-    ev.stopPropagation();
-    pywebview.api.remove(key);
-    var n = document.getElementById("q-" + key);
-    if (n) n.remove();
-    delete cards[key];
-    updateEmpty();
-  });
-  document.getElementById("queue").prepend(el);
+function makeCard(key){
+  var el=document.createElement("div");el.className="gc";el.id="g-"+key;
+  el.innerHTML=
+    '<div class="gth"><img class="gimg" style="display:none" alt=""><span class="gph">'+play(26)+'</span>'+
+    '<div class="gbadge"></div>'+
+    '<div class="gacts"><button class="ga gfolder" aria-label="Open folder">'+ic('folder',15)+'</button>'+
+    '<button class="ga gdel" aria-label="Remove from list">'+ic('trash',15)+'</button></div>'+
+    '<div class="gplay">'+play(20)+'</div>'+
+    '<div class="gprog"><i></i></div></div>'+
+    '<div class="gm"><div class="gt">…</div><div class="gs"></div></div>';
+  el.addEventListener("dblclick",function(){if(cards[key]&&cards[key].path)pywebview.api.play(key);});
+  el.querySelector(".gfolder").addEventListener("click",function(e){e.stopPropagation();pywebview.api.reveal(key);});
+  el.querySelector(".gdel").addEventListener("click",function(e){e.stopPropagation();pywebview.api.remove(key);ui.drop(key);});
+  gridEl.prepend(el);
   return el;
 }
-var ui = {
-  item: function (o) {
-    var key = o.key;
-    var el = document.getElementById("q-" + key);
-    if (!el) { el = makeCard(key); }
-    var c = cards[key] || {};
-    for (var k in o) if (o[k] != null) c[k] = o[k];
-    cards[key] = c;
-    var e = document.getElementById("empty"); if (e) e.remove();
-    // thumb (set once)
-    if (c.thumb) {
-      var im = el.querySelector(".qthumb");
-      if (!im.getAttribute("src")) {
-        im.onerror = function () { im.style.display = "none"; };
-        im.src = c.thumb; im.style.display = "";
-      }
-    }
-    el.querySelector(".qtitle").textContent = c.title || "…";
-    el.className = "qcard " + (c.status || "") +
-      (c.exists === false ? " missing" : "") + (c.path ? " playable" : "");
-    el.querySelector(".qmeta").textContent = metaText(c);
-    var pe = el.querySelector(".qpath");
-    if (c.path) {
-      var dir = c.path.replace(/[\\/][^\\/]*$/, "");
-      pe.textContent = dir + "‎";  // LRM keeps rtl-truncated path readable
-      pe.title = c.path;
-      pe.style.display = "block";
-    } else {
-      pe.style.display = "none";
-    }
-    if (c.pct != null) el.querySelector(".qbar i").style.width = c.pct + "%";
-    var st = el.querySelector(".qstate");
-    if (c.status === "done") st.innerHTML = c.exists === false ? ICON_BAD : ICON_OK;
-    else if (c.status === "failed") st.innerHTML = ICON_BAD;
-    else if (c.status === "queued") st.innerHTML = ICON_CLOCK;
-    else st.innerHTML = '<span class="spin"></span>';
-    var vis = c.path ? "flex" : "none";
-    el.querySelector(".qdel").style.display = vis;
-    el.querySelector(".qfolder").style.display = vis;
+var ui={
+  item:function(o){
+    var key=o.key,el=document.getElementById("g-"+key);
+    if(!el)el=makeCard(key);
+    var c=cards[key]||{};for(var k in o)if(o[k]!=null)c[k]=o[k];cards[key]=c;
+    if(c.thumb){var im=el.querySelector(".gimg");if(!im.getAttribute("src")){
+      im.onerror=function(){im.style.display="none";};
+      im.onload=function(){el.querySelector(".gph").style.display="none";};
+      im.src=c.thumb;im.style.display="";}}
+    el.className="gc "+(c.status||"")+(c.exists===false?" missing":"")+(c.path?" playable":"");
+    el.querySelector(".gt").textContent=c.title||"…";
+    var b=el.querySelector(".gbadge");
+    if(c.status==="downloading"&&c.pct!=null)b.textContent=Math.round(c.pct)+"%";
+    else if(c.status==="queued")b.textContent="Queued";
+    else if(c.status==="processing")b.textContent="Processing";
+    else if(c.duration)b.textContent=c.duration;else b.textContent="";
+    el.querySelector(".gs").innerHTML=subHtml(c);
+    if(c.pct!=null)el.querySelector(".gprog i").style.width=c.pct+"%";
+    refreshView();
   },
-  drop: function (key) {
-    var n = document.getElementById("q-" + key);
-    if (n) n.remove();
-    delete cards[key];
-    updateEmpty();
+  drop:function(key){var n=document.getElementById("g-"+key);if(n)n.remove();delete cards[key];refreshView();},
+  log:function(t){
+    var isP=t.indexOf("[download]")===0&&t.indexOf("%")!==-1;
+    if(isP&&lastProg){lastProg.textContent=t;}
+    else{var d=document.createElement("div");d.textContent=t;var c=lineClass(t);if(c)d.className=c;
+      logEl.appendChild(d);lastProg=isP?d:null;
+      if(logEl.childElementCount>2000)logEl.removeChild(logEl.firstChild);}
+    logEl.scrollTop=logEl.scrollHeight;
   },
-  log: function (t) {
-    var isProg = t.indexOf("[download]") === 0 && t.indexOf("%") !== -1;
-    if (isProg && lastProg) { lastProg.textContent = t; }
-    else {
-      var d = document.createElement("div");
-      d.textContent = t;
-      var c = lineClass(t); if (c) d.className = c;
-      logEl.appendChild(d);
-      lastProg = isProg ? d : null;
-      if (logEl.childElementCount > 2000) logEl.removeChild(logEl.firstChild);
-    }
-    logEl.scrollTop = logEl.scrollHeight;
+  setState:function(s){
+    document.getElementById("dir").textContent=s.dir;
+    setStat(document.getElementById("auth"),s.logged_in?"signed in":"login needed",s.logged_in?"ok":"warn");
+    setStat(document.getElementById("deps"),s.deps_ok?"deps ready":"deps missing",s.deps_ok?"ok":"warn");
+    document.getElementById("dl").disabled=!s.deps_ok;
+    document.getElementById("s-go").disabled=!s.deps_ok;
+    document.getElementById("cancel").style.display=s.busy?"inline-flex":"none";
   },
-  setState: function (s) {
-    document.getElementById("dir").textContent = s.dir;
-    setChip(document.getElementById("auth"),
-            s.logged_in ? "signed in" : "login needed",
-            s.logged_in ? "ok" : "warn");
-    setChip(document.getElementById("deps"),
-            s.deps_ok ? "deps ready" : "deps missing",
-            s.deps_ok ? "ok" : "warn");
-    document.getElementById("dl").disabled = !s.deps_ok;   // queue-friendly: never busy-locked
-    document.getElementById("s-go").disabled = !s.deps_ok;
-    document.getElementById("cancel").disabled = !s.busy;
-  },
-  done: function (ok) {
-    if (ok) { okCount++; } else { failCount++; }
-    setChip(document.getElementById("counts"),
-            "ok " + okCount + " · failed " + failCount,
-            failCount ? "warn" : (okCount ? "ok" : ""));
+  done:function(ok){
+    if(ok){okCount++;}else{failCount++;}
+    var el=document.getElementById("counts");
+    el.className="chip "+(failCount?"warn":(okCount?"ok":""));
+    el.innerHTML='<span class="dot"></span>ok '+okCount+' · failed '+failCount;
   }
 };
-function qualityChanged() {
-  var q = document.getElementById("quality").value;
-  document.getElementById("customfmt").className = q === "custom" ? "active" : "";
+function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function switchMode(m){
+  dlMode=m;
+  var ms=document.querySelectorAll("#modeseg .ms");
+  for(var i=0;i<ms.length;i++)ms[i].classList.toggle("on",ms[i].getAttribute("data-m")===m);
+  document.getElementById("autopane").style.display=m==="auto"?"flex":"none";
+  document.getElementById("custompane").style.display=m==="custom"?"flex":"none";
 }
-function startDl() {
-  var u = document.getElementById("url").value.trim();
-  if (!u) { ui.log("[!] paste a URL first"); return; }
-  pendingUrl = u; lastInfo = null;
-  openSheet(u);
-  pywebview.api.fetch_info(u).then(function (info) {
-    if (pendingUrl === u) { lastInfo = info; fillSheet(info, u); }
-  })["catch"](function () {
-    if (pendingUrl === u) fillSheet({ ok: false, error: "" }, u);
+function pickVfmt(el){
+  curVfmt=el.getAttribute("data-v");
+  var bs=document.querySelectorAll("#vfmtseg .fs");
+  for(var i=0;i<bs.length;i++)bs[i].classList.remove("on");
+  el.classList.add("on");
+}
+function autoFmt(){
+  var q=document.getElementById("vqual").value;
+  var cf=curVfmt==="legacy"?"[vcodec^=avc]":"[vcodec~='^(av01|vp0?9|hev1|hvc1)']";
+  if(q==="best")return "bv*"+cf+"+ba/bv*+ba/b";
+  if(q==="lowest")return "wv*+ba/w";
+  return "bv*[height<="+q+"]"+cf+"+ba/bv*[height<="+q+"]+ba/b[height<="+q+"]";
+}
+function genericV(){return [
+  {label:"1080p",sub:"",size:"",fmt:"bv*[height<=1080]+ba/b[height<=1080]"},
+  {label:"720p",sub:"",size:"",fmt:"bv*[height<=720]+ba/b[height<=720]"},
+  {label:"480p",sub:"",size:"",fmt:"bv*[height<=480]+ba/b[height<=480]"},
+  {label:"360p",sub:"",size:"",fmt:"bv*[height<=360]+ba/b[height<=360]"}
+];}
+function renderVList(vformats){
+  var list=(vformats&&vformats.length)?vformats.slice():genericV();
+  list.unshift({label:"Best available",sub:"Best video + best audio",size:"",fmt:"bv*+ba/b"});
+  var ql=document.getElementById("vlist");ql.innerHTML="";
+  list.forEach(function(o,i){
+    var b=document.createElement("button");
+    b.className="qrow"+(i===0?" on":"");
+    b.setAttribute("data-fmt",o.fmt);
+    b.innerHTML='<span class="qmain">'+esc(o.label)+'</span><span class="qsub">'+esc(o.sub||"")+'</span><span class="qsize">'+esc(o.size||"")+'</span><span class="qck">'+ic("check",15)+'</span>';
+    b.onclick=function(){var rs=ql.querySelectorAll(".qrow");for(var j=0;j<rs.length;j++)rs[j].classList.remove("on");b.classList.add("on");};
+    ql.appendChild(b);
   });
 }
-function openSheet(u) {
-  var t = document.getElementById("s-thumb");
-  t.style.display = "none"; t.removeAttribute("src");
-  document.getElementById("s-title").textContent = "Fetching info…";
-  document.getElementById("s-sub").textContent = u;
-  var isPl = u.indexOf("list=") !== -1 || u.indexOf("/@") !== -1;
-  document.getElementById("plrow").className = isPl ? "srow show" : "srow";
-  document.getElementById("fmtout").style.display = "none";
-  document.getElementById("scrim").className = "open";
-  document.getElementById("sheet").className = "open";
+function startDl(){
+  var u=document.getElementById("url").value.trim();
+  if(!u){ui.log("[!] paste a URL first");return;}
+  pendingUrl=u;lastInfo=null;openDlg(u);
+  pywebview.api.fetch_info(u).then(function(info){if(pendingUrl===u){lastInfo=info;fillDlg(info,u);}})
+    ["catch"](function(){if(pendingUrl===u)fillDlg({ok:false,error:""},u);});
 }
-function fillSheet(info, u) {
-  var t = document.getElementById("s-thumb");
-  if (info && info.ok) {
-    document.getElementById("s-title").textContent = info.title;
-    var sub = info.uploader || "";
-    if (info.kind === "playlist") {
-      sub = (sub ? sub + " · " : "") + info.count + " videos";
-      document.getElementById("plrow").className = "srow show";
-    } else if (info.duration) {
-      sub = (sub ? sub + " · " : "") + info.duration;
-    }
-    document.getElementById("s-sub").textContent = sub;
-    if (info.thumb) {
-      t.onerror = function () { t.style.display = "none"; };
-      t.src = info.thumb; t.style.display = "";
-    }
-  } else {
-    document.getElementById("s-title").textContent =
-      "Couldn't fetch info — you can still download";
-    document.getElementById("s-sub").textContent = (info && info.error) || u;
+function openDlg(u){
+  var t=document.getElementById("s-thumb");t.style.display="none";t.removeAttribute("src");
+  document.getElementById("s-title").textContent="Fetching info…";
+  document.getElementById("s-sub").textContent=u;
+  switchMode("auto");
+  curVfmt="quality";
+  document.querySelector('#vfmtseg .fs[data-v="quality"]').classList.add("on");
+  document.querySelector('#vfmtseg .fs[data-v="legacy"]').classList.remove("on");
+  document.getElementById("vqual").value="1080";
+  document.getElementById("vlist").innerHTML='<div class="qload">Loading formats…</div>';
+  var isPl=u.indexOf("list=")!==-1||u.indexOf("/@")!==-1;
+  document.getElementById("plrow").className=isPl?"field on":"field";
+  document.getElementById("scrim").className="open";
+  document.getElementById("dlg").className="open";
+}
+function fillDlg(info,u){
+  var t=document.getElementById("s-thumb");
+  if(info&&info.ok){
+    document.getElementById("s-title").textContent=info.title;
+    var sub=info.uploader||"";
+    if(info.kind==="playlist"){sub=(sub?sub+" · ":"")+info.count+" videos";
+      document.getElementById("plrow").className="field on";}
+    else if(info.duration){sub=(sub?sub+" · ":"")+info.duration;}
+    document.getElementById("s-sub").textContent=sub;
+    if(info.thumb){t.onerror=function(){t.style.display="none";};t.src=info.thumb;t.style.display="";}
+  }else{
+    document.getElementById("s-title").textContent="Couldn't fetch info — you can still download";
+    document.getElementById("s-sub").textContent=(info&&info.error)||u;
   }
+  renderVList(info&&info.ok?info.vformats:null);
 }
-function closeSheet() {
-  document.getElementById("scrim").className = "";
-  document.getElementById("sheet").className = "";
+function closeDlg(){document.getElementById("scrim").className="";document.getElementById("dlg").className="";}
+function confirmDl(){
+  if(!pendingUrl)return;
+  var fmt;
+  if(dlMode==="auto")fmt=autoFmt();
+  else{var sel=document.querySelector("#vlist .qrow.on");fmt=sel?sel.getAttribute("data-fmt"):"bv*+ba/b";}
+  closeDlg();
+  switchTab("active");
+  pywebview.api.start_download(pendingUrl,"custom",fmt,
+    document.getElementById("plstart").value,document.getElementById("plend").value,
+    document.getElementById("ck-watched").checked,document.getElementById("ck-stamp").checked,
+    (lastInfo&&lastInfo.ok&&lastInfo.kind==="video")?
+      {id:lastInfo.id,title:lastInfo.title,uploader:lastInfo.uploader,duration:lastInfo.duration,thumb:lastInfo.thumb}:
+      (lastInfo&&lastInfo.ok?{title:lastInfo.title,thumb:lastInfo.thumb}:{}))
+    .then(function(r){if(r==="no-deps")ui.log("[!] dependencies missing");});
 }
-function confirmDl() {
-  if (!pendingUrl) return;
-  var q = document.getElementById("quality").value;
-  var mode = q === "default" ? "default" : "custom";
-  var custom = q === "custom" ? document.getElementById("customfmt").value : q;
-  if (q === "default") custom = "";
-  var meta = (lastInfo && lastInfo.ok && lastInfo.kind === "video") ? {
-    id: lastInfo.id, title: lastInfo.title, uploader: lastInfo.uploader,
-    duration: lastInfo.duration, thumb: lastInfo.thumb
-  } : (lastInfo && lastInfo.ok ? { title: lastInfo.title, thumb: lastInfo.thumb } : {});
-  closeSheet();
-  pywebview.api.start_download(
-    pendingUrl, mode, custom,
-    document.getElementById("plstart").value,
-    document.getElementById("plend").value,
-    document.getElementById("ck-watched").checked,
-    document.getElementById("ck-stamp").checked,
-    meta
-  ).then(function (r) {
-    if (r === "no-deps") ui.log("[!] dependencies missing — tap the refresh icon");
-  });
-}
-function sheetFormats() {
-  var out = document.getElementById("fmtout");
-  out.style.display = "block";
-  out.textContent = "Fetching formats…";
-  pywebview.api.list_formats(pendingUrl || document.getElementById("url").value)
-    .then(function (t) { out.textContent = t; });
-}
-function pickDir() {
-  pywebview.api.pick_folder().then(function (d) {
-    document.getElementById("dir").textContent = d;
-  });
-}
-document.addEventListener("keydown", function (e) {
-  var sheetOpen = document.getElementById("sheet").className.indexOf("open") !== -1;
-  if (e.key === "Escape") { closeSheet(); return; }
-  if (e.key === "Enter") {
-    if (sheetOpen) { confirmDl(); }
-    else if (document.activeElement === document.getElementById("url")) { startDl(); }
-  }
+function pickDir(){pywebview.api.pick_folder().then(function(d){document.getElementById("dir").textContent=d;});}
+document.addEventListener("keydown",function(e){
+  var open=document.getElementById("dlg").className.indexOf("open")!==-1;
+  if(e.key==="Escape"){closeDlg();return;}
+  if(e.key==="Enter"){if(open){confirmDl();}
+    else if(document.activeElement===document.getElementById("url")){startDl();}}
 });
-window.addEventListener("pywebviewready", function () {
-  logEl = document.getElementById("log");
+window.addEventListener("pywebviewready",function(){
+  logEl=document.getElementById("log");gridEl=document.getElementById("grid");
+  switchTab("hist");
   document.getElementById("url").focus();
-  pywebview.api.get_state().then(function (s) {
+  pywebview.api.get_state().then(function(s){
     ui.setState(s);
-    document.getElementById("ck-watched").checked = s.mark_watched !== false;
-    document.getElementById("ck-stamp").checked = s.set_timestamp !== false;
+    defaultFmt=s.default_format||"";
+    document.getElementById("ck-watched").checked=s.mark_watched!==false;
+    document.getElementById("ck-stamp").checked=s.set_timestamp!==false;
   });
-  pywebview.api.get_history().then(function (list) {
-    list.slice().reverse().forEach(function (e) {
-      ui.item({ key: e.id, status: "done", title: e.title, channel: e.channel,
-                duration: e.duration, size: e.size_h, format: e.format,
-                thumb: e.thumb, path: e.path, exists: e.exists });
+  pywebview.api.get_history().then(function(list){
+    list.slice().reverse().forEach(function(e){
+      ui.item({key:e.id,status:"done",title:e.title,channel:e.channel,duration:e.duration,
+               size:e.size_h,format:e.format,thumb:e.thumb,path:e.path,exists:e.exists});
     });
   });
 });
