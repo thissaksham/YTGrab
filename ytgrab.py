@@ -307,6 +307,30 @@ def set_file_times(path, epoch):
         k32.CloseHandle(h)
 
 
+class _SHFILEOP(ctypes.Structure):
+    _fields_ = (("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR))
+
+
+def recycle(path):
+    """Send a file to the Recycle Bin (a recoverable delete). True on success."""
+    try:
+        buf = ctypes.create_unicode_buffer(str(path) + "\x00")  # double-null list
+        op = _SHFILEOP()
+        op.wFunc = 3  # FO_DELETE
+        op.pFrom = ctypes.cast(buf, wintypes.LPCWSTR)
+        op.fFlags = 0x40 | 0x10 | 0x400 | 0x04  # ALLOWUNDO|NOCONFIRM|NOERRORUI|SILENT
+        shell32 = ctypes.windll.shell32
+        shell32.SHFileOperationW.argtypes = [ctypes.c_void_p]
+        shell32.SHFileOperationW.restype = ctypes.c_int
+        rc = shell32.SHFileOperationW(ctypes.byref(op))
+        return rc == 0 and not op.fAnyOperationsAborted
+    except Exception:
+        return False
+
+
 # === dependency manager ===
 
 def http_get(url, timeout=30):
@@ -724,10 +748,22 @@ class Api:
         return "missing"
 
     def remove(self, key):
-        """Remove an item from the list/history. Does NOT delete the file."""
+        """Delete the download: send its file to the Recycle Bin, then drop it
+        from history. The Recycle Bin makes an accidental click recoverable."""
+        entry = next((e for e in self.history if e.get("id") == key), None)
+        result = "nofile"
+        if entry:
+            p = entry.get("path", "")
+            if p and Path(p).exists():
+                if recycle(p):
+                    self._push(f"[+] deleted (Recycle Bin): {Path(p).name}")
+                    result = "deleted"
+                else:
+                    self._push(f"[!] could not delete file: {Path(p).name}")
+                    result = "error"
         self.history = [e for e in self.history if e.get("id") != key]
         save_history(self.history)
-        return "ok"
+        return result
 
     # --- info / formats ---
 
@@ -867,12 +903,21 @@ class Api:
         if not (YTDLP.exists() and FFMPEG.exists()):
             return "no-deps"
         fmt = custom_fmt.strip() if (fmt_mode == "custom" and custom_fmt.strip()) else DEFAULT_FORMAT
-        items = None
-        if is_playlist(url) and (pl_start or pl_end):
-            items = f"{pl_start or ''}:{pl_end or ''}"
         self.cfg["mark_watched"] = bool(mark_watched)
         self.cfg["set_timestamp"] = bool(set_timestamp)
         save_config(self.cfg)
+        if not self._worker_up:
+            self._worker_up = True
+            threading.Thread(target=self._queue_loop, daemon=True).start()
+        if is_playlist(url):
+            # expand into per-video jobs so each video gets its own
+            # postprocess (timestamp, mark-watched, json cleanup, history)
+            # the moment it finishes -- like the original downloader.cmd
+            threading.Thread(target=self._enqueue_playlist,
+                             args=(url, fmt, pl_start, pl_end,
+                                   bool(mark_watched), bool(set_timestamp)),
+                             daemon=True).start()
+            return "queued"
 
         meta = meta or {}
         vid = meta.get("id")
@@ -886,12 +931,58 @@ class Api:
             self._item(key=key, status="queued",
                        title=meta.get("title") or url, thumb=meta.get("thumb"))
 
-        self._q.put((url, fmt, items, bool(mark_watched), bool(set_timestamp),
+        self._q.put((url, fmt, None, bool(mark_watched), bool(set_timestamp),
                      key, placeholder))
-        if not self._worker_up:
-            self._worker_up = True
-            threading.Thread(target=self._queue_loop, daemon=True).start()
         return "queued"
+
+    def _enqueue_playlist(self, url, fmt, pl_start, pl_end, mark, stamp):
+        """Flat-extract a playlist/channel and queue one job per video.
+        A given range is passed to yt-dlp itself (-I) so huge channels only
+        extract the requested slice instead of paging through everything."""
+        def num(v, d):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return d
+        start = max(num(pl_start, 1), 1)
+        end = num(pl_end, 0)
+        rng = f"{start}:{end if end else ''}" if (pl_start or pl_end) else ""
+        self._push("[*] fetching playlist entries..." +
+                   (f" (items {rng})" if rng else " (whole list - may take a while)"))
+        base = [YTDLP, "--no-warnings", "-J", "--flat-playlist",
+                "--socket-timeout", "10", "--retries", "2", *yt_args(url)]
+        if rng:
+            base += ["-I", rng]
+        args, tmp = self._auth_for(url)
+        data = None
+        try:
+            r = subprocess.run([str(c) for c in base + args + [url]],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", creationflags=NO_WINDOW,
+                               timeout=120 if rng else 900)
+            data = json.loads(r.stdout) if (r.stdout or "").strip() else None
+        except Exception as e:
+            self._push(f"[!] playlist fetch failed: {e}")
+        finally:
+            self._shred(tmp)
+        entries = (data or {}).get("entries") or []
+        if not entries:
+            self._push("[!] no videos found in this playlist/channel")
+            return
+        self._push(f"[*] queueing {len(entries)} videos")
+        for e in entries:
+            vid = e.get("id") or ""
+            vurl = e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+            if not vurl:
+                continue
+            key = vid if vid else f"job-{os.urandom(3).hex()}"
+            kw = {"key": key, "status": "queued", "title": e.get("title") or vurl}
+            if len(vid) == 11:
+                kw["thumb"] = f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+            if e.get("duration"):
+                kw["duration"] = fmt_dur(e["duration"])
+            self._item(**kw)
+            self._q.put((vurl, fmt, None, mark, stamp, key, False))
 
     def _queue_loop(self):
         while True:
@@ -907,10 +998,20 @@ class Api:
         """Turn raw yt-dlp lines into per-video queue card updates with phases."""
         state = {"cur": None, "items": {}}
 
+        def finish_prev(new_key):
+            # a new video has started: the previous one is finished (playlists)
+            prev = state["cur"]
+            if prev and prev != new_key:
+                pit = state["items"].get(prev)
+                if pit and pit.get("status") not in ("failed", "done"):
+                    pit["status"] = "done"
+                    self._item(key=prev, status="done", pct=100)
+
         def parse(line):
             m = RE_YT_ID.match(line)
             if m:
                 vid = m.group(1)
+                finish_prev(vid)
                 state["cur"] = vid
                 it = state["items"].setdefault(vid, {"pct": -1, "dests": 0})
                 it["status"] = "fetching"
@@ -922,6 +1023,7 @@ class Api:
                 name = os.path.basename(m.group(1))
                 idm = RE_FILE_ID.search(name)
                 key = idm.group(1) if idm else re.sub(r"\.f\d+\.\w+$|\.\w+$", "", name)
+                finish_prev(key)
                 state["cur"] = key
                 it = state["items"].setdefault(key, {"pct": -1, "dests": 0})
                 it["dests"] += 1
@@ -1053,7 +1155,8 @@ HTML = r"""<!DOCTYPE html>
   --ok:#6BD6A8; --warn:#E7B968; --danger:#E8837D;
 }
 *{box-sizing:border-box;}
-body{margin:0;height:100vh;display:flex;flex-direction:column;gap:15px;
+html{height:100%;}
+body{margin:0;height:100%;overflow:hidden;display:flex;flex-direction:column;gap:15px;
   padding:16px 20px 16px;background:var(--bg);color:var(--tx);
   font:14px/1.5 Inter,"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
   -webkit-font-smoothing:antialiased;user-select:none;}
@@ -1094,7 +1197,8 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
 .save button:hover{color:var(--actx);}
 .lbl{font-size:11px;letter-spacing:.8px;color:var(--dim);}
 #grid{flex:1;min-height:0;overflow-y:auto;display:grid;
-  grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;align-content:start;padding:1px;}
+  grid-template-columns:repeat(auto-fill,minmax(190px,1fr));grid-auto-rows:max-content;
+  gap:14px;align-content:start;padding:1px;}
 .empty{grid-column:1/-1;min-height:220px;display:flex;flex-direction:column;align-items:center;
   justify-content:center;gap:12px;color:var(--dim);border:1px dashed var(--line2);border-radius:14px;}
 .empty svg{opacity:.5;}
@@ -1364,7 +1468,7 @@ function makeCard(key){
     '<div class="gth"><img class="gimg" style="display:none" alt=""><span class="gph">'+play(26)+'</span>'+
     '<div class="gbadge"></div>'+
     '<div class="gacts"><button class="ga gfolder" aria-label="Open folder">'+ic('folder',15)+'</button>'+
-    '<button class="ga gdel" aria-label="Remove from list">'+ic('trash',15)+'</button></div>'+
+    '<button class="ga gdel" aria-label="Delete video (to Recycle Bin)">'+ic('trash',15)+'</button></div>'+
     '<div class="gplay">'+play(20)+'</div>'+
     '<div class="gprog"><i></i></div></div>'+
     '<div class="gm"><div class="gt">…</div><div class="gs"></div></div>';
