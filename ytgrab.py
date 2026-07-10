@@ -566,6 +566,7 @@ def build_entry(info, target, vid):
         "format": fmt_label(info, target),
         "size": size, "size_h": human_size(size),
         "thumb": thumb, "path": str(target), "ts": time.time(),
+        "released": epoch_from_info(info) or 0,
     }
 
 
@@ -609,6 +610,14 @@ def is_playlist(url):
 def is_youtube(url):
     low = url.lower()
     return "youtube.com" in low or "youtu.be" in low
+
+
+RE_YTID_URL = re.compile(r"(?:v=|/shorts/|youtu\.be/|/embed/|/v/|/live/)([A-Za-z0-9_-]{11})")
+
+
+def youtube_id(url):
+    m = RE_YTID_URL.search(url or "")
+    return m.group(1) if m else ""
 
 
 def yt_args(url):
@@ -742,7 +751,8 @@ class Api:
         save_history(self.history)
         self._item(key=e["id"], status="done", title=e["title"], channel=e["channel"],
                    duration=e["duration"], size=e["size_h"], format=e["format"],
-                   thumb=e["thumb"], path=e["path"])
+                   thumb=e["thumb"], path=e["path"], ts=e.get("ts"),
+                   released=e.get("released"))
 
     def play(self, key):
         for e in self.history:
@@ -958,7 +968,7 @@ class Api:
             return "queued"
 
         meta = meta or {}
-        vid = meta.get("id")
+        vid = meta.get("id") or youtube_id(url)
         if vid:
             key, placeholder = vid, False
             self._item(key=key, status="queued", title=meta.get("title"),
@@ -1205,7 +1215,7 @@ class Api:
                        "downloadable formats via SABR.)")
 
         for k in state["items"]:
-            self._jobs.setdefault(k, (url, fmt, items, mark, stamp))
+            self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))
         entries = postprocess(dl_dir, started, self, mark, stamp)
         done_ids = set()
         for e in entries:
@@ -1281,6 +1291,14 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   padding-left:5px;border-left:0.5px solid var(--line2);margin-left:4px;}
 .save button:hover{color:var(--actx);}
 .lbl{font-size:11px;letter-spacing:.8px;color:var(--dim);}
+.dlhead{display:flex;align-items:center;gap:8px;}
+.sorti{color:var(--dim);}
+#sortsel{height:28px;border:0.5px solid var(--line2);border-radius:8px;background:var(--s2);
+  color:var(--mut);font:500 11.5px/1 inherit;padding:0 26px 0 10px;cursor:pointer;
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238A8A94' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat;background-position:right 9px center;}
+#sortsel:hover{color:var(--tx);}
 #grid{flex:1;min-height:0;overflow-y:auto;display:grid;
   grid-template-columns:repeat(auto-fill,minmax(190px,1fr));grid-auto-rows:max-content;
   gap:14px;align-content:start;padding:1px;}
@@ -1426,7 +1444,16 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
     stroke-linecap="round" stroke-linejoin="round"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>
   <b id="dir"></b><button onclick="pickDir()">Change</button></div>
 
-<div><span class="lbl">DOWNLOADS</span></div>
+<div class="dlhead">
+  <span class="lbl">DOWNLOADS</span><span class="sp"></span>
+  <svg class="sorti" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13"/><path d="M6 12h9"/><path d="M4 18h5"/></svg>
+  <select id="sortsel" onchange="sortGrid(this.value)">
+    <option value="ts">Recently downloaded</option>
+    <option value="released" selected>Release date</option>
+    <option value="title">Title (A-Z)</option>
+  </select>
+</div>
 
 <div id="grid">
   <div class="empty" id="empty">
@@ -1576,7 +1603,10 @@ function makeCard(key){
 var ui={
   item:function(o){
     var key=o.key,el=document.getElementById("g-"+key);
-    if(!el)el=makeCard(key);
+    if(!el){
+      if(!o.status&&!cards[key])return;
+      el=makeCard(key);
+    }
     var c=cards[key]||{};for(var k in o)if(o[k]!=null)c[k]=o[k];cards[key]=c;
     if(c.thumb){var im=el.querySelector(".gimg");if(!im.getAttribute("src")){
       im.onerror=function(){im.style.display="none";};
@@ -1621,6 +1651,7 @@ var ui={
     var el=document.getElementById("counts");
     el.className="chip "+(failCount?"warn":(okCount?"ok":""));
     el.innerHTML='<span class="dot"></span>ok '+okCount+' · failed '+failCount;
+    sortGrid(curSort);
   },
   updateAvail:function(v){
     var u=document.getElementById("upd");
@@ -1629,6 +1660,21 @@ var ui={
   }
 };
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+var curSort="released";
+function sortGrid(mode){
+  curSort=mode;
+  var nodes=Array.prototype.slice.call(gridEl.querySelectorAll(".gc"));
+  nodes.sort(function(a,b){
+    var ca=cards[a.id.slice(2)]||{},cb=cards[b.id.slice(2)]||{};
+    var aa=ca.status!=="done",ba=cb.status!=="done";
+    if(aa!==ba)return aa?-1:1;
+    if(aa)return 0;
+    if(mode==="title")return (ca.title||"").localeCompare(cb.title||"");
+    if(mode==="released")return (cb.released||0)-(ca.released||0);
+    return (cb.ts||0)-(ca.ts||0);
+  });
+  nodes.forEach(function(n){gridEl.appendChild(n);});
+}
 function skipChanged(){
   var skip=document.getElementById("ck-skip").checked;
   ["modeseg","autopane","custompane"].forEach(function(id){
@@ -1758,8 +1804,10 @@ window.addEventListener("pywebviewready",function(){
   pywebview.api.get_history().then(function(list){
     list.slice().reverse().forEach(function(e){
       ui.item({key:e.id,status:"done",title:e.title,channel:e.channel,duration:e.duration,
-               size:e.size_h,format:e.format,thumb:e.thumb,path:e.path,exists:e.exists});
+               size:e.size_h,format:e.format,thumb:e.thumb,path:e.path,exists:e.exists,
+               ts:e.ts,released:e.released});
     });
+    sortGrid(curSort);
   });
 });
 </script></body></html>"""
