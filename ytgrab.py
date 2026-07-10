@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import webbrowser
 import zipfile
 from urllib.parse import quote, urlparse
 from ctypes import wintypes
@@ -35,6 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
+APP_VERSION = "1.4.0"
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -357,6 +359,27 @@ def download_file(url, dest, push, label):
     tmp.replace(dest)
 
 
+RELEASES_API = "https://api.github.com/repos/thissaksham/YTGrab/releases/latest"
+RELEASES_URL = "https://github.com/thissaksham/YTGrab/releases/latest"
+
+
+def _ver_tuple(v):
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(x) for x in nums[:3]) if nums else (0,)
+
+
+def check_update():
+    """Latest release tag if newer than this build, else None. Never raises."""
+    try:
+        with http_get(RELEASES_API, timeout=10) as r:
+            tag = json.loads(r.read().decode()).get("tag_name") or ""
+        if tag and _ver_tuple(tag) > _ver_tuple(APP_VERSION):
+            return tag
+    except Exception:
+        pass
+    return None
+
+
 def run_quiet(cmd, push=None, timeout=None):
     proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -604,6 +627,7 @@ class Api:
         self.busy = False
         self.logged_in = False
         self._jar_cache = {}          # require-key -> (jar_text, expiry); memory only
+        self._jobs = {}               # card key -> job args, for retry
         self._q = queue.Queue()
         self._worker_up = False
 
@@ -893,10 +917,23 @@ class Api:
             self._push("[!] download cancelled")
         return "ok"
 
+    def retry(self, key):
+        job = self._jobs.get(key)
+        if not job:
+            return "unknown"
+        self._item(key=key, status="queued")
+        self._q.put((*job, key, False))
+        return "queued"
+
+    def open_releases(self):
+        webbrowser.open(RELEASES_URL)
+        return "ok"
+
     # --- queue ---
 
     def start_download(self, url, fmt_mode, custom_fmt, pl_start, pl_end,
-                       mark_watched=True, set_timestamp=True, meta=None):
+                       mark_watched=True, set_timestamp=True,
+                       skip_download=False, meta=None):
         url = (url or "").strip().strip('"')
         if not url:
             return "no-url"
@@ -915,7 +952,8 @@ class Api:
             # the moment it finishes -- like the original downloader.cmd
             threading.Thread(target=self._enqueue_playlist,
                              args=(url, fmt, pl_start, pl_end,
-                                   bool(mark_watched), bool(set_timestamp)),
+                                   bool(mark_watched), bool(set_timestamp),
+                                   bool(skip_download)),
                              daemon=True).start()
             return "queued"
 
@@ -931,11 +969,14 @@ class Api:
             self._item(key=key, status="queued",
                        title=meta.get("title") or url, thumb=meta.get("thumb"))
 
-        self._q.put((url, fmt, None, bool(mark_watched), bool(set_timestamp),
-                     key, placeholder))
+        if not meta.get("title"):
+            threading.Thread(target=self._prefetch, args=([(key, url)],), daemon=True).start()
+        self._jobs[key] = (url, fmt, None, bool(mark_watched), bool(set_timestamp),
+                           bool(skip_download))
+        self._q.put((*self._jobs[key], key, placeholder))
         return "queued"
 
-    def _enqueue_playlist(self, url, fmt, pl_start, pl_end, mark, stamp):
+    def _enqueue_playlist(self, url, fmt, pl_start, pl_end, mark, stamp, skip=False):
         """Flat-extract a playlist/channel and queue one job per video.
         A given range is passed to yt-dlp itself (-I) so huge channels only
         extract the requested slice instead of paging through everything."""
@@ -970,6 +1011,7 @@ class Api:
             self._push("[!] no videos found in this playlist/channel")
             return
         self._push(f"[*] queueing {len(entries)} videos")
+        pf = []
         for e in entries:
             vid = e.get("id") or ""
             vurl = e.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
@@ -982,7 +1024,27 @@ class Api:
             if e.get("duration"):
                 kw["duration"] = fmt_dur(e["duration"])
             self._item(**kw)
-            self._q.put((vurl, fmt, None, mark, stamp, key, False))
+            if not e.get("title"):
+                pf.append((key, vurl))
+            self._jobs[key] = (vurl, fmt, None, mark, stamp, skip)
+            self._q.put((*self._jobs[key], key, False))
+        if pf:
+            threading.Thread(target=self._prefetch, args=(pf,), daemon=True).start()
+
+    def _prefetch(self, pairs):
+        """Fill title + thumbnail for queued cards (fast oEmbed) so you can tell
+        which queued item is which before it starts downloading."""
+        for key, url in pairs:
+            try:
+                info = self._oembed(url)
+            except Exception:
+                info = None
+            if info and info.get("title"):
+                kw = {"key": key, "title": info["title"]}
+                if info.get("thumb"):
+                    kw["thumb"] = info["thumb"]
+                self._item(**kw)
+            time.sleep(0.15)
 
     def _queue_loop(self):
         while True:
@@ -1096,11 +1158,30 @@ class Api:
             self.proc = None
         return code, botcheck
 
-    def _download_worker(self, url, fmt, items, mark, stamp, job_key, placeholder):
+    def _download_worker(self, url, fmt, items, mark, stamp, skip, job_key, placeholder):
         if placeholder:
             self._drop(job_key)
         self.busy = True
         self._set_state()
+        if skip:
+            # skip-download: only mark the video watched, nothing touches disk
+            self._item(key=job_key, status="processing", phase="Marking watched")
+            ok = False
+            if not mark:
+                self._push("[!] skip-download with mark-watched off: nothing to do")
+            elif is_youtube(url) and self.logged_in:
+                ok = browser_mark_watched(url, self._push)
+            else:
+                self._push("[!] mark-watched needs a YouTube link and a signed-in profile")
+            self._item(key=job_key, status="done" if ok else "failed")
+            self.busy = False
+            self._set_state()
+            if UI_WIN:
+                try:
+                    UI_WIN.evaluate_js(f"ui.done({json.dumps(ok)})")
+                except Exception:
+                    pass
+            return
         started = time.time()
         dl_dir = self.download_dir()
         cmd = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
@@ -1123,6 +1204,8 @@ class Api:
                        "it clears on its own. (Cookies don't help - they yield 0 "
                        "downloadable formats via SABR.)")
 
+        for k in state["items"]:
+            self._jobs.setdefault(k, (url, fmt, items, mark, stamp))
         entries = postprocess(dl_dir, started, self, mark, stamp)
         done_ids = set()
         for e in entries:
@@ -1185,8 +1268,10 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
 .btn:disabled{opacity:.4;cursor:default;}
 .btn.dl{padding:0 24px;background:var(--ac);color:#fff;}
 .btn.dl:hover:not(:disabled){filter:brightness(1.08);}
-.btn.cancel{display:none;padding:0 18px;background:var(--s3);color:var(--mut);}
-.btn.cancel:hover:not(:disabled){background:#24242B;color:var(--tx);}
+.upd{display:none;align-items:center;height:25px;padding:0 11px;border:none;
+  border-radius:20px;background:var(--acbg);color:var(--actx);cursor:pointer;
+  font:500 11.5px/1 inherit;}
+.upd:hover{filter:brightness(1.15);}
 :focus-visible{outline:2px solid var(--ac);outline-offset:2px;}
 .save{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--mut);
   align-self:flex-start;padding:6px 12px;border-radius:9px;background:var(--s1);border:0.5px solid var(--line);}
@@ -1221,11 +1306,13 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   color:#fff;display:none;align-items:center;justify-content:center;}
 .gc.done.playable:hover .gplay{display:flex;}
 .gacts{position:absolute;top:6px;left:6px;display:none;gap:5px;}
-.gc.done:hover .gacts{display:flex;}
+.gc:hover .gacts{display:flex;}
 .ga{width:28px;height:28px;border-radius:8px;border:none;background:rgba(8,8,10,.72);color:#D6D6DE;
   display:flex;align-items:center;justify-content:center;cursor:pointer;}
 .ga:hover{background:rgba(8,8,10,.92);color:#fff;}
 .ga.gdel:hover{color:var(--danger);}
+.ga.gretry:hover{color:var(--ok);}
+.ga.gcancel:hover{color:var(--danger);}
 .gm{padding:9px 11px 11px;}
 .gt{font-size:12.5px;font-weight:500;line-height:1.35;margin-bottom:5px;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:34px;}
@@ -1317,6 +1404,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   <h1>YTGrab</h1>
   <span id="deps" class="stat"><span class="dot"></span>checking deps</span>
   <span id="auth" class="stat"><span class="dot"></span>login</span>
+  <button id="upd" class="upd" onclick="pywebview.api.open_releases()"></button>
   <span class="sp"></span>
   <button class="ib" id="loginbtn" title="Log into the pasted URL's site (YouTube if empty)"
           aria-label="Login" onclick="pywebview.api.login(document.getElementById('url').value)">
@@ -1331,7 +1419,6 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
       stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
     <span id="dlLabel">Download</span></button>
-  <button class="btn cancel" id="cancel" onclick="pywebview.api.cancel()">Cancel</button>
 </div>
 
 <div class="save">
@@ -1409,6 +1496,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   <div class="opts">
     <label class="ck"><input type="checkbox" id="ck-watched" checked>Mark as watched</label>
     <label class="ck"><input type="checkbox" id="ck-stamp" checked>Set file date to upload date</label>
+    <label class="ck"><input type="checkbox" id="ck-skip" onchange="skipChanged()">Skip download (only mark watched)</label>
   </div>
   <div class="sact">
     <span class="sp"></span>
@@ -1421,6 +1509,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
 var okCount=0,failCount=0,lastProg=null,logEl,gridEl,pendingUrl=null,lastInfo=null,defaultFmt="";
 var dlMode="auto",curVfmt="quality";
 var cards={};
+var isBusy=false;
 var LABEL={fetching:"Fetching info",downloading:"Downloading",processing:"Processing",
            done:"Completed",failed:"Failed",queued:"Queued"};
 var P={
@@ -1428,7 +1517,9 @@ var P={
  trash:'<path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>',
  check:'<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-4.5"/>',
  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
- alert:'<path d="M12 3 2 20h20z"/><path d="M12 10v4"/><path d="M12 17h.01"/>'
+ alert:'<path d="M12 3 2 20h20z"/><path d="M12 10v4"/><path d="M12 17h.01"/>',
+ retry:'<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
+ x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'
 };
 function ic(n,sz,cls){return '<svg class="'+(cls||'')+'" width="'+(sz||16)+'" height="'+(sz||16)+
   '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';}
@@ -1467,13 +1558,17 @@ function makeCard(key){
   el.innerHTML=
     '<div class="gth"><img class="gimg" style="display:none" alt=""><span class="gph">'+play(26)+'</span>'+
     '<div class="gbadge"></div>'+
-    '<div class="gacts"><button class="ga gfolder" aria-label="Open folder">'+ic('folder',15)+'</button>'+
-    '<button class="ga gdel" aria-label="Delete video (to Recycle Bin)">'+ic('trash',15)+'</button></div>'+
+    '<div class="gacts"><button class="ga gretry" aria-label="Retry download" style="display:none">'+ic('retry',15)+'</button>'+
+    '<button class="ga gcancel" aria-label="Cancel download" style="display:none">'+ic('x',15)+'</button>'+
+    '<button class="ga gfolder" aria-label="Open folder" style="display:none">'+ic('folder',15)+'</button>'+
+    '<button class="ga gdel" aria-label="Delete video (to Recycle Bin)" style="display:none">'+ic('trash',15)+'</button></div>'+
     '<div class="gplay">'+play(20)+'</div>'+
     '<div class="gprog"><i></i></div></div>'+
     '<div class="gm"><div class="gt">…</div><div class="gs"></div></div>';
   el.addEventListener("dblclick",function(){if(cards[key]&&cards[key].path)pywebview.api.play(key);});
   el.querySelector(".gfolder").addEventListener("click",function(e){e.stopPropagation();pywebview.api.reveal(key);});
+  el.querySelector(".gretry").addEventListener("click",function(e){e.stopPropagation();pywebview.api.retry(key);});
+  el.querySelector(".gcancel").addEventListener("click",function(e){e.stopPropagation();pywebview.api.cancel();});
   el.querySelector(".gdel").addEventListener("click",function(e){e.stopPropagation();pywebview.api.remove(key);ui.drop(key);});
   gridEl.prepend(el);
   return el;
@@ -1496,6 +1591,11 @@ var ui={
     else if(c.duration)b.textContent=c.duration;else b.textContent="";
     el.querySelector(".gs").innerHTML=subHtml(c);
     if(c.pct!=null)el.querySelector(".gprog i").style.width=c.pct+"%";
+    var act=(c.status==="downloading"||c.status==="processing"||c.status==="fetching");
+    el.querySelector(".gcancel").style.display=act?"flex":"none";
+    el.querySelector(".gretry").style.display=c.status==="failed"?"flex":"none";
+    el.querySelector(".gfolder").style.display=(c.status==="done"&&c.path)?"flex":"none";
+    el.querySelector(".gdel").style.display=(c.status==="done"||c.status==="failed")?"flex":"none";
     refreshView();
   },
   drop:function(key){var n=document.getElementById("g-"+key);if(n)n.remove();delete cards[key];refreshView();},
@@ -1513,16 +1613,35 @@ var ui={
     setStat(document.getElementById("deps"),s.deps_ok?"deps ready":"deps missing",s.deps_ok?"ok":"warn");
     document.getElementById("dl").disabled=!s.deps_ok;
     document.getElementById("s-go").disabled=!s.deps_ok;
-    document.getElementById("cancel").style.display=s.busy?"inline-flex":"none";
+    isBusy=!!s.busy;
+    document.getElementById("dlLabel").textContent=isBusy?"Queue":"Download";
   },
   done:function(ok){
     if(ok){okCount++;}else{failCount++;}
     var el=document.getElementById("counts");
     el.className="chip "+(failCount?"warn":(okCount?"ok":""));
     el.innerHTML='<span class="dot"></span>ok '+okCount+' · failed '+failCount;
+  },
+  updateAvail:function(v){
+    var u=document.getElementById("upd");
+    u.textContent="Update available: "+v;
+    u.style.display="inline-flex";
   }
 };
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function skipChanged(){
+  var skip=document.getElementById("ck-skip").checked;
+  ["modeseg","autopane","custompane"].forEach(function(id){
+    var el=document.getElementById(id);
+    if(el){el.style.opacity=skip?"0.35":"";el.style.pointerEvents=skip?"none":"";}
+  });
+  var w=document.getElementById("ck-watched"),st=document.getElementById("ck-stamp");
+  if(skip)w.checked=true;
+  w.disabled=skip; st.disabled=skip;
+  w.parentElement.style.opacity=skip?"0.55":"";
+  st.parentElement.style.opacity=skip?"0.35":"";
+  document.getElementById("s-go").textContent=skip?"Mark watched":(isBusy?"Queue":"Download");
+}
 function switchMode(m){
   dlMode=m;
   var ms=document.querySelectorAll("#modeseg .ms");
@@ -1581,6 +1700,7 @@ function openDlg(u){
   document.querySelector('#vfmtseg .fs[data-v="legacy"]').classList.remove("on");
   document.getElementById("vqual").value="1080";
   document.getElementById("vlist").innerHTML='<div class="qload">Loading formats…</div>';
+  document.getElementById("ck-skip").checked=false;skipChanged();
   var isPl=u.indexOf("list=")!==-1||u.indexOf("/@")!==-1;
   document.getElementById("plrow").className=isPl?"field on":"field";
   document.getElementById("scrim").className="open";
@@ -1609,9 +1729,11 @@ function confirmDl(){
   if(dlMode==="auto")fmt=autoFmt();
   else{var sel=document.querySelector("#vlist .qrow.on");fmt=sel?sel.getAttribute("data-fmt"):"bv*+ba/b";}
   closeDlg();
+  document.getElementById("url").value="";
   pywebview.api.start_download(pendingUrl,"custom",fmt,
     document.getElementById("plstart").value,document.getElementById("plend").value,
     document.getElementById("ck-watched").checked,document.getElementById("ck-stamp").checked,
+    document.getElementById("ck-skip").checked,
     (lastInfo&&lastInfo.ok&&lastInfo.kind==="video")?
       {id:lastInfo.id,title:lastInfo.title,uploader:lastInfo.uploader,duration:lastInfo.duration,thumb:lastInfo.thumb}:
       (lastInfo&&lastInfo.ok?{title:lastInfo.title,thumb:lastInfo.thumb}:{}))
@@ -1655,6 +1777,13 @@ def bootstrap(api):
     api._set_state()
     api._push("[login] checking sign-in state...")
     api._recheck_login()
+    latest = check_update()
+    if latest:
+        api._push(f"[*] update available: {latest} - click the chip in the header")
+        try:
+            UI_WIN.evaluate_js(f"ui.updateAvail({json.dumps(latest)})")
+        except Exception:
+            pass
 
 
 def main():
