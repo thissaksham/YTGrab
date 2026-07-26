@@ -36,7 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.5.2"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.5.3"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1026,9 +1026,10 @@ class Api:
             download_file(assets[want], dest, self._upd_push, "update")
             self._upd_ui("Installing...")
             if installed:
-                self._push("[update] launching installer - the app will close and reopen")
-                subprocess.Popen([str(dest), "/SILENT", "/FORCECLOSEAPPLICATIONS",
-                                  "/NOCANCEL", "/SUPPRESSMSGBOXES"], creationflags=NO_WINDOW)
+                self._push("[update] installing - the app closes and reopens in a moment")
+                subprocess.Popen([str(dest), "/VERYSILENT", "/SUPPRESSMSGBOXES",
+                                  "/FORCECLOSEAPPLICATIONS", "/NORESTART", "/NOCANCEL"],
+                                 creationflags=NO_WINDOW)
             else:
                 self._push("[update] replacing the portable exe and restarting...")
                 self._swap_portable(dest)
@@ -2002,10 +2003,6 @@ def main():
         ok = ensure_deps(log)
         sys.exit(0 if ok else 1)
     (APP_DIR / "cookies_youtube.txt").unlink(missing_ok=True)
-    try:  # named mutex lets the updater's installer detect+close this app
-        ctypes.windll.kernel32.CreateMutexW(None, False, "YTGrab_Running_Mutex")
-    except Exception:
-        pass
     global UI_WIN
     api = Api()
     UI_WIN = webview.create_window(APP_NAME, html=HTML, js_api=api,

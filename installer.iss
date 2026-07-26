@@ -4,7 +4,7 @@
 ; Build needs: dist\YTGrab\ (onedir).
 ; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.5.2"
+#define AppVersion "1.5.3"
 #define AppExe "YTGrab.exe"
 
 [Setup]
@@ -28,8 +28,9 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
-; let the in-app updater's silent install close+replace a running instance
-AppMutex=YTGrab_Running_Mutex
+; the in-app updater runs this silently; CloseApplications force-closes the running
+; instance so files can be replaced. No AppMutex -- it would make silent setup abort
+; instead of updating while the app is still running.
 CloseApplications=yes
 RestartApplications=no
 
@@ -53,5 +54,7 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-; no skipifsilent -> the in-app updater's silent install relaunches the app too
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall
+; plain entry (NOT postinstall) so it runs in silent installs too -> the app
+; relaunches itself after an in-app update. postinstall entries only run when the
+; interactive Finished page is shown, so they never fire during a silent update.
+Filename: "{app}\{#AppExe}"; Flags: nowait
