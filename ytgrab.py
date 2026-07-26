@@ -36,7 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.5.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.5.2"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1428,6 +1428,9 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238A8A94' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
   background-repeat:no-repeat;background-position:right 9px center;}
 #sortsel:hover{color:var(--tx);}
+#sortdir{height:28px;min-width:28px;border:0.5px solid var(--line2);border-radius:8px;
+  background:var(--s2);color:var(--mut);font:600 14px/1 inherit;cursor:pointer;padding:0 7px;}
+#sortdir:hover{color:var(--tx);}
 #grid{flex:1;min-height:0;overflow-y:auto;display:grid;
   grid-template-columns:repeat(auto-fill,minmax(190px,1fr));grid-auto-rows:max-content;
   gap:14px;align-content:start;padding:1px;}
@@ -1577,11 +1580,12 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   <span class="lbl">DOWNLOADS</span><span class="sp"></span>
   <svg class="sorti" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
     stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13"/><path d="M6 12h9"/><path d="M4 18h5"/></svg>
-  <select id="sortsel" onchange="sortGrid(this.value)">
-    <option value="ts">Recently downloaded</option>
+  <select id="sortsel" onchange="pickSort(this.value)">
+    <option value="ts">Download date</option>
     <option value="released" selected>Release date</option>
-    <option value="title">Title (A-Z)</option>
+    <option value="title">Title</option>
   </select>
+  <button id="sortdir" onclick="flipDir()" title="Ascending / descending">↓</button>
 </div>
 
 <div id="grid">
@@ -1802,21 +1806,27 @@ function updateClick(){
   pywebview.api.run_update();
 }
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
-var curSort="released";
+var curSort="released", curDir=-1;          // dir: 1 = ascending, -1 = descending
+var NAT={ts:-1, released:-1, title:1};       // natural default direction per field
 function sortGrid(mode){
   curSort=mode;
   var nodes=Array.prototype.slice.call(gridEl.querySelectorAll(".gc"));
   nodes.sort(function(a,b){
     var ca=cards[a.id.slice(2)]||{},cb=cards[b.id.slice(2)]||{};
     var aa=ca.status!=="done",ba=cb.status!=="done";
-    if(aa!==ba)return aa?-1:1;
+    if(aa!==ba)return aa?-1:1;               // active downloads always pinned on top
     if(aa)return 0;
-    if(mode==="title")return (ca.title||"").localeCompare(cb.title||"");
-    if(mode==="released")return (cb.released||0)-(ca.released||0);
-    return (cb.ts||0)-(ca.ts||0);
+    var base;                                // ascending comparison, flipped by curDir
+    if(mode==="title")base=(ca.title||"").localeCompare(cb.title||"");
+    else if(mode==="released")base=(ca.released||0)-(cb.released||0);
+    else base=(ca.ts||0)-(cb.ts||0);
+    return base*curDir;
   });
   nodes.forEach(function(n){gridEl.appendChild(n);});
 }
+function updDirIcon(){var b=document.getElementById("sortdir");if(b)b.textContent=curDir>0?"↑":"↓";}
+function pickSort(mode){curDir=NAT[mode]||-1;updDirIcon();sortGrid(mode);}
+function flipDir(){curDir=-curDir;updDirIcon();sortGrid(curSort);}
 function skipChanged(){
   var skip=document.getElementById("ck-skip").checked;
   ["modeseg","autopane","custompane"].forEach(function(id){
