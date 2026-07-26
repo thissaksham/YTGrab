@@ -36,7 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.5.3"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.5.4"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1386,6 +1386,7 @@ body{margin:0;height:100%;overflow:hidden;display:flex;flex-direction:column;gap
 svg{flex:none;}
 header{display:flex;align-items:center;gap:13px;}
 header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
+.ver{font-size:10px;font-weight:600;color:var(--dim);margin-left:5px;vertical-align:2px;letter-spacing:.3px;}
 .stat{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);}
 .stat .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);}
 .stat.ok .dot{background:var(--ok);}
@@ -1552,7 +1553,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
 </style></head><body>
 
 <header>
-  <h1>YTGrab</h1>
+  <h1>YTGrab<span class="ver">v__APP_VERSION__</span></h1>
   <span id="deps" class="stat"><span class="dot"></span>checking deps</span>
   <span id="auth" class="stat"><span class="dot"></span>login</span>
   <button id="upd" class="upd" onclick="updateClick()"></button>
@@ -2005,7 +2006,7 @@ def main():
     (APP_DIR / "cookies_youtube.txt").unlink(missing_ok=True)
     global UI_WIN
     api = Api()
-    UI_WIN = webview.create_window(APP_NAME, html=HTML, js_api=api,
+    UI_WIN = webview.create_window(APP_NAME, html=HTML.replace("__APP_VERSION__", APP_VERSION), js_api=api,
                                    width=980, height=780, min_size=(760, 560))
     webview.start(lambda: bootstrap(api), private_mode=False,
                   storage_path=str(PROFILE_DIR))
