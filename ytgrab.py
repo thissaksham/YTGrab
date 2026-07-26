@@ -36,7 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.4.2"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.5.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -51,8 +51,10 @@ YTDLP = BIN_DIR / "yt-dlp.exe"
 FFMPEG = BIN_DIR / "ffmpeg.exe"
 FFPROBE = BIN_DIR / "ffprobe.exe"
 FF_VER_FILE = BIN_DIR / "ffmpeg.ver"
+NODE = BIN_DIR / "node.exe"  # JS runtime yt-dlp uses to solve YouTube's sig/n challenge
 
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+NODE_URL = "https://nodejs.org/dist/latest-v22.x/win-x64/node.exe"  # standalone, ~85 MB
 FF_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FF_VER_URLS = ["https://www.gyan.dev/ffmpeg/builds/release-version",
                "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.ver"]
@@ -411,6 +413,14 @@ def ensure_deps(push, force_ffmpeg=False):
     except Exception as e:
         push(f"[deps] yt-dlp setup failed: {e}")
 
+    try:
+        if not NODE.exists():
+            push("[deps] downloading node.exe (solves YouTube's JS challenge)... (~85 MB)")
+            download_file(NODE_URL, NODE, push, "node")
+            push("[deps] node ready")
+    except Exception as e:
+        push(f"[deps] node setup failed (YouTube may hit bot-checks): {e}")
+
     have_ff = FFMPEG.exists() and FFPROBE.exists()
     if have_ff and not force_ffmpeg:
         push("[deps] ffmpeg present (auto-update off; use Update to refresh)")
@@ -621,10 +631,16 @@ def youtube_id(url):
 
 
 def yt_args(url):
-    """More bot-resistant player clients for YouTube; keeps the full format
-    list (session cookies would drop it to 0 via SABR, so we stay anonymous)."""
+    """Player clients that keep the full format list (session cookies would drop
+    it to 0 via SABR, so we stay anonymous), plus a bundled JS runtime so yt-dlp
+    can solve YouTube's signature/n challenge. Without the runtime those fail,
+    downloads throttle, and YouTube bot-checks the session after a few videos.
+    Deno (yt-dlp's default) proved flaky here; node solved it reliably."""
     if is_youtube(url):
-        return ["--extractor-args", "youtube:player_client=default,web_safari"]
+        a = ["--extractor-args", "youtube:player_client=default,web_safari"]
+        if NODE.exists():
+            a += ["--no-js-runtimes", "--js-runtimes", f"node:{NODE}"]
+        return a
     return []
 
 
@@ -1209,10 +1225,14 @@ class Api:
         self._shred(tmp)
 
         if code != 0 and botcheck:
-            self._push("[!] YouTube bot-check: this IP is temporarily flagged "
-                       "(usually from many rapid downloads). Wait a bit and retry; "
-                       "it clears on its own. (Cookies don't help - they yield 0 "
-                       "downloadable formats via SABR.)")
+            if not NODE.exists():
+                self._push("[!] YouTube bot-check: the JS-challenge runtime (node) isn't "
+                           "installed yet. Let the deps download finish (see log above), "
+                           "then hit Retry.")
+            else:
+                self._push("[!] YouTube bot-check. The JS challenge failed this time - "
+                           "hit Retry; if it persists, wait a minute (YouTube rate-limits "
+                           "bursts) and retry.")
 
         for k in state["items"]:
             self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))

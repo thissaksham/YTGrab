@@ -4,7 +4,7 @@
 ; Build needs: dist\YTGrab\ (onedir), deps\ffmpeg.exe, deps\ffprobe.exe.
 ; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.4.2"
+#define AppVersion "1.5.0"
 #define AppExe "YTGrab.exe"
 
 [Setup]
@@ -45,8 +45,10 @@ Source: "dist\YTGrab\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdir
 ; bundled stable tools -> app's data\bin so deps are ready without downloading
 Source: "deps\ffmpeg.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: ignoreversion
 Source: "deps\ffprobe.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: ignoreversion
-; latest yt-dlp downloaded to {tmp} during setup (below); copied if it succeeded
+; latest yt-dlp + node (JS challenge runtime) downloaded to {tmp} during setup
+; (below); each copied if its download succeeded, else the app fetches on first run
 Source: "{tmp}\yt-dlp.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: external ignoreversion skipifsourcedoesntexist
+Source: "{tmp}\node.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: external ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -70,6 +72,14 @@ begin
         'yt-dlp.exe', '', nil);
     except
       Log('yt-dlp download failed (app will fetch it on first run): '
+          + GetExceptionMessage);
+    end;
+    try
+      DownloadTemporaryFile(
+        'https://nodejs.org/dist/latest-v22.x/win-x64/node.exe',
+        'node.exe', '', nil);
+    except
+      Log('node download failed (app will fetch it on first run): '
           + GetExceptionMessage);
     end;
   end;
