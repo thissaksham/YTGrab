@@ -36,7 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.5.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.5.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -382,6 +382,27 @@ def check_update():
     return None
 
 
+def latest_release():
+    """(tag, {asset_name: download_url}) for the latest release, else (None, {})."""
+    try:
+        with http_get(RELEASES_API, timeout=10) as r:
+            data = json.loads(r.read().decode())
+        tag = data.get("tag_name") or ""
+        assets = {a.get("name"): a.get("browser_download_url")
+                  for a in data.get("assets", []) if a.get("name")}
+        return tag, assets
+    except Exception:
+        return None, {}
+
+
+def is_installed_build():
+    """True for the installed onedir build (has _internal beside the exe); False
+    for the portable onefile exe or a source run -- picks installer vs portable."""
+    if not getattr(sys, "frozen", False):
+        return False
+    return (Path(sys.executable).resolve().parent / "_internal").is_dir()
+
+
 def run_quiet(cmd, push=None, timeout=None):
     proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -655,6 +676,7 @@ class Api:
         self._jobs = {}               # card key -> job args, for retry
         self._q = queue.Queue()
         self._worker_up = False
+        self._updating = False
 
     # --- UI bridge ---
 
@@ -954,6 +976,93 @@ class Api:
     def open_releases(self):
         webbrowser.open(RELEASES_URL)
         return "ok"
+
+    def run_update(self):
+        """One-click update: download the right asset (installer or portable) and
+        apply it in place, then relaunch. Falls back to opening the releases page."""
+        if self._updating:
+            return "busy"
+        self._updating = True
+        threading.Thread(target=self._do_update, daemon=True).start()
+        return "started"
+
+    def _upd_ui(self, text):
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js(f"ui.updating({json.dumps(text)})")
+            except Exception:
+                pass
+
+    def _upd_push(self, line):
+        self._push(line)
+        m = re.search(r"(\d+)%", line)
+        if m:
+            self._upd_ui(f"Downloading {m.group(1)}%")
+
+    def _do_update(self):
+        try:
+            tag, assets = latest_release()
+            if not tag or not assets:
+                self._push("[update] couldn't reach GitHub - opening the releases page")
+                webbrowser.open(RELEASES_URL)
+                return
+            installed = is_installed_build()
+            want = None
+            for name in assets:
+                low = name.lower()
+                if installed and low.endswith(".exe") and "setup" in low:
+                    want = name
+                    break
+                if not installed and low == "ytgrab.exe":
+                    want = name
+                    break
+            if not want:
+                self._push("[update] no matching asset - opening the releases page")
+                webbrowser.open(RELEASES_URL)
+                return
+            dest = Path(tempfile.gettempdir()) / want
+            self._push(f"[update] downloading {want} ({tag})...")
+            self._upd_ui("Downloading update...")
+            download_file(assets[want], dest, self._upd_push, "update")
+            self._upd_ui("Installing...")
+            if installed:
+                self._push("[update] launching installer - the app will close and reopen")
+                subprocess.Popen([str(dest), "/SILENT", "/FORCECLOSEAPPLICATIONS",
+                                  "/NOCANCEL", "/SUPPRESSMSGBOXES"], creationflags=NO_WINDOW)
+            else:
+                self._push("[update] replacing the portable exe and restarting...")
+                self._swap_portable(dest)
+            time.sleep(1.5)
+            self._quit()
+        except Exception as e:
+            self._push(f"[update] failed: {e} - opening the releases page")
+            try:
+                webbrowser.open(RELEASES_URL)
+            except Exception:
+                pass
+        finally:
+            self._updating = False
+
+    def _swap_portable(self, newexe):
+        """Can't overwrite a running exe -> a helper waits for exit, swaps, relaunches."""
+        cur = Path(sys.executable)
+        bat = Path(tempfile.gettempdir()) / "ytgrab_update.bat"
+        bat.write_text(
+            "@echo off\r\n"
+            "ping -n 3 127.0.0.1 >nul\r\n"
+            f'move /y "{newexe}" "{cur}" >nul\r\n'
+            f'start "" "{cur}"\r\n'
+            'del "%~f0"\r\n',
+            encoding="utf-8")
+        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=NO_WINDOW)
+
+    def _quit(self):
+        try:
+            if UI_WIN:
+                UI_WIN.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
     # --- queue ---
 
@@ -1442,7 +1551,7 @@ header h1{margin:0;font-size:18px;font-weight:600;letter-spacing:-.3px;}
   <h1>YTGrab</h1>
   <span id="deps" class="stat"><span class="dot"></span>checking deps</span>
   <span id="auth" class="stat"><span class="dot"></span>login</span>
-  <button id="upd" class="upd" onclick="pywebview.api.open_releases()"></button>
+  <button id="upd" class="upd" onclick="updateClick()"></button>
   <span class="sp"></span>
   <button class="ib" id="loginbtn" title="Log into the pasted URL's site (YouTube if empty)"
           aria-label="Login" onclick="pywebview.api.login(document.getElementById('url').value)">
@@ -1675,10 +1784,23 @@ var ui={
   },
   updateAvail:function(v){
     var u=document.getElementById("upd");
-    u.textContent="Update available: "+v;
+    u.dataset.ver=v;
+    u.textContent="Update to "+v+" ↓";
     u.style.display="inline-flex";
+  },
+  updating:function(t){
+    var u=document.getElementById("upd");
+    if(u) u.textContent=t;
   }
 };
+function updateClick(){
+  var u=document.getElementById("upd");
+  if(u.dataset.busy) return;
+  if(!confirm("Download and install "+(u.dataset.ver||"the update")+" now?\n\nThe app will close and reopen automatically.")) return;
+  u.dataset.busy="1";
+  u.textContent="Starting update…";
+  pywebview.api.run_update();
+}
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 var curSort="released";
 function sortGrid(mode){
@@ -1870,6 +1992,10 @@ def main():
         ok = ensure_deps(log)
         sys.exit(0 if ok else 1)
     (APP_DIR / "cookies_youtube.txt").unlink(missing_ok=True)
+    try:  # named mutex lets the updater's installer detect+close this app
+        ctypes.windll.kernel32.CreateMutexW(None, False, "YTGrab_Running_Mutex")
+    except Exception:
+        pass
     global UI_WIN
     api = Api()
     UI_WIN = webview.create_window(APP_NAME, html=HTML, js_api=api,

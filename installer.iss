@@ -1,10 +1,10 @@
-; YTGrab installer — bundles the fast (onedir) build so startup stays quick.
-; Bundles ffmpeg/ffprobe (stable) and downloads the latest yt-dlp during setup,
-; so the app opens ready-to-use with no first-launch dependency download.
-; Build needs: dist\YTGrab\ (onedir), deps\ffmpeg.exe, deps\ffprobe.exe.
+; YTGrab installer — ships the fast (onedir) build so startup stays quick.
+; Deps (yt-dlp, ffmpeg, node) are fetched by the app on first launch, same as the
+; portable build -- so the installer stays lean (no bundled ~90 MB ffmpeg).
+; Build needs: dist\YTGrab\ (onedir).
 ; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.5.0"
+#define AppVersion "1.5.1"
 #define AppExe "YTGrab.exe"
 
 [Setup]
@@ -28,6 +28,10 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
+; let the in-app updater's silent install close+replace a running instance
+AppMutex=YTGrab_Running_Mutex
+CloseApplications=yes
+RestartApplications=no
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
@@ -40,15 +44,8 @@ Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFMPEG"; Value
 Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "FFPROBE"; ValueData: "{localappdata}\YTGrab\bin\ffprobe.exe"; Flags: preservestringtype uninsdeletevalue; Tasks: envvars
 
 [Files]
-; the entire onedir build (exe + _internal folder)
+; the entire onedir build (exe + _internal folder); deps are fetched on first run
 Source: "dist\YTGrab\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
-; bundled stable tools -> app's data\bin so deps are ready without downloading
-Source: "deps\ffmpeg.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: ignoreversion
-Source: "deps\ffprobe.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: ignoreversion
-; latest yt-dlp + node (JS challenge runtime) downloaded to {tmp} during setup
-; (below); each copied if its download succeeded, else the app fetches on first run
-Source: "{tmp}\yt-dlp.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: external ignoreversion skipifsourcedoesntexist
-Source: "{tmp}\node.exe"; DestDir: "{localappdata}\YTGrab\bin"; Flags: external ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -56,31 +53,5 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
-
-
-[Code]
-// Fetch the latest yt-dlp into {tmp} right before files are copied. Works in
-// both interactive and silent installs; the [Files] entry above copies it in
-// (and is skipped if this failed -- the app then fetches yt-dlp on first run).
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssInstall then begin
-    try
-      DownloadTemporaryFile(
-        'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe',
-        'yt-dlp.exe', '', nil);
-    except
-      Log('yt-dlp download failed (app will fetch it on first run): '
-          + GetExceptionMessage);
-    end;
-    try
-      DownloadTemporaryFile(
-        'https://nodejs.org/dist/latest-v22.x/win-x64/node.exe',
-        'node.exe', '', nil);
-    except
-      Log('node download failed (app will fetch it on first run): '
-          + GetExceptionMessage);
-    end;
-  end;
-end;
+; no skipifsilent -> the in-app updater's silent install relaunches the app too
+Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall
