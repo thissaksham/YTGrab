@@ -36,7 +36,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.5.4"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.5.5"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -46,6 +46,7 @@ BIN_DIR = APP_DIR / "bin"
 PROFILE_DIR = APP_DIR / "profile"
 CONFIG_FILE = APP_DIR / "config.json"
 HISTORY_FILE = APP_DIR / "history.json"
+FAILED_FILE = APP_DIR / "failed.json"   # failed/unfinished downloads, retryable after restart
 LOG_FILE = APP_DIR / "ytgrab.log"
 YTDLP = BIN_DIR / "yt-dlp.exe"
 FFMPEG = BIN_DIR / "ffmpeg.exe"
@@ -115,6 +116,18 @@ def load_history():
 def save_history(h):
     try:
         HISTORY_FILE.write_text(json.dumps(h, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_failed():
+    d = _load_json(FAILED_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def save_failed(f):
+    try:
+        FAILED_FILE.write_text(json.dumps(f, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -674,9 +687,16 @@ class Api:
         self.logged_in = False
         self._jar_cache = {}          # require-key -> (jar_text, expiry); memory only
         self._jobs = {}               # card key -> job args, for retry
+        self._cardmeta = {}           # card key -> last title/thumb/etc, for persisting failures
+        self.failed = load_failed()   # card key -> failed-job record, survives restart
         self._q = queue.Queue()
         self._worker_up = False
         self._updating = False
+        for k, r in self.failed.items():   # make failed downloads retryable after a restart
+            self._jobs[k] = (r.get("url"), r.get("fmt"), r.get("items"),
+                             r.get("mark", True), r.get("stamp", True), r.get("skip", False))
+            self._cardmeta[k] = {f: r[f] for f in ("title", "channel", "thumb", "duration")
+                                 if r.get(f) is not None}
 
     # --- UI bridge ---
 
@@ -688,11 +708,34 @@ class Api:
                 pass
 
     def _item(self, **kw):
+        key = kw.get("key")
+        if key:   # remember display fields so a failed card can be rebuilt after restart
+            m = self._cardmeta.setdefault(key, {})
+            for f in ("title", "channel", "thumb", "duration"):
+                if kw.get(f) is not None:
+                    m[f] = kw[f]
         if UI_WIN:
             try:
                 UI_WIN.evaluate_js(f"ui.item({json.dumps(kw)})")
             except Exception:
                 pass
+
+    def _save_failed(self, key):
+        """Persist a failed download so it survives a restart and stays retryable."""
+        job = self._jobs.get(key)
+        if not job:
+            return
+        url, fmt, items, mark, stamp, skip = job
+        rec = {"url": url, "fmt": fmt, "items": items, "mark": mark,
+               "stamp": stamp, "skip": skip}
+        rec.update(self._cardmeta.get(key, {}))
+        self.failed[key] = rec
+        save_failed(self.failed)
+
+    def _clear_failed(self, key):
+        if key in self.failed:
+            del self.failed[key]
+            save_failed(self.failed)
 
     def _drop(self, key):
         if UI_WIN:
@@ -782,6 +825,12 @@ class Api:
     def get_history(self):
         return [{**e, "exists": Path(e.get("path", "")).exists()} for e in self.history]
 
+    def get_pending(self):
+        """Failed/unfinished downloads from a previous run, so they can be retried."""
+        return [{"key": k, "title": r.get("title") or r.get("url"),
+                 "channel": r.get("channel"), "thumb": r.get("thumb"),
+                 "duration": r.get("duration")} for k, r in self.failed.items()]
+
     def _add_history(self, e):
         self.history = [x for x in self.history if x.get("id") != e["id"]]
         self.history.insert(0, e)
@@ -835,6 +884,7 @@ class Api:
                     result = "error"
         self.history = [e for e in self.history if e.get("id") != key]
         save_history(self.history)
+        self._clear_failed(key)   # also dismiss it from the retry-after-restart list
         return result
 
     # --- info / formats ---
@@ -1310,6 +1360,7 @@ class Api:
             else:
                 self._push("[!] mark-watched needs a YouTube link and a signed-in profile")
             self._item(key=job_key, status="done" if ok else "failed")
+            self._clear_failed(job_key) if ok else self._save_failed(job_key)
             self.busy = False
             self._set_state()
             if UI_WIN:
@@ -1350,12 +1401,15 @@ class Api:
         done_ids = set()
         for e in entries:
             self._add_history(e)
+            self._clear_failed(e["id"])
             done_ids.add(e["id"])
         for key, it in state["items"].items():
             if key not in done_ids and it.get("status") != "done":
                 self._item(key=key, status="failed")
+                self._save_failed(key)
         if not placeholder and job_key not in done_ids and not entries:
             self._item(key=job_key, status="failed")
+            self._save_failed(job_key)
 
         self._push("[+] done" if code == 0 else f"[!] finished with errors (exit {code})")
         self.busy = False
@@ -1961,7 +2015,13 @@ window.addEventListener("pywebviewready",function(){
                size:e.size_h,format:e.format,thumb:e.thumb,path:e.path,exists:e.exists,
                ts:e.ts,released:e.released});
     });
-    sortGrid(curSort);
+    pywebview.api.get_pending().then(function(pend){
+      pend.forEach(function(p){
+        ui.item({key:p.key,status:"failed",title:p.title,channel:p.channel,
+                 thumb:p.thumb,duration:p.duration});
+      });
+      sortGrid(curSort);
+    });
   });
 });
 </script></body></html>"""
