@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.9.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.10.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -200,6 +200,16 @@ def entry_thumb(e):
         return "data:image/jpeg;base64," + base64.b64encode(Path(tf).read_bytes()).decode()
     except OSError:
         return ""
+
+
+def rel_dir(path, root):
+    """Sub-folder a file sits in, relative to its library root ('' at the top).
+    Always '/'-separated so the UI can split it."""
+    try:
+        rel = Path(path).resolve().parent.relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return ""
+    return "" if str(rel) == "." else rel.as_posix()
 
 
 def unique_path(p):
@@ -762,6 +772,7 @@ class Api:
                 self.tabs.insert(0, dict(d))
         self.views = self.cfg.get("views") or {}   # per-tab sort/direction/filter
         self.active_tab = DOWNLOADS_TAB
+        self.active_path = ""                      # sub-folder open in that tab
         migrated = False
         for e in self.history:     # entries predating tabs: sort them into one
             if not e.get("tab"):
@@ -936,7 +947,19 @@ class Api:
     def set_tab(self, tid):
         """JS tells us which tab is showing, so a drop lands in the right folder."""
         self.active_tab = tid or DOWNLOADS_TAB
+        self.active_path = ""
         return "ok"
+
+    def set_path(self, rel):
+        """Sub-folder currently open, so drops land where the user is looking."""
+        self.active_path = (rel or "").strip("/")
+        return "ok"
+
+    def drop_dir(self, tid):
+        d = Path(self.tab_folder(tid))
+        if tid == self.active_tab and self.active_path:
+            d = d / self.active_path
+        return d
 
     def add_tab(self):
         """New tab pointing at a folder the user picks; indexes what's already there."""
@@ -1007,12 +1030,15 @@ class Api:
         return "started"
 
     def _scan_worker(self, tid):
+        """Walk the whole tree: sub-folders are part of the library too, and
+        each video keeps the folder it lives in (see rel_dir)."""
         folder = Path(self.tab_folder(tid))
         known = {(e.get("path") or "").lower() for e in self.history}
         try:
-            files = [p for p in sorted(folder.iterdir())
-                     if p.is_file() and p.suffix.lower() in VIDEO_EXTS
-                     and str(p).lower() not in known]
+            files = sorted(p for p in folder.rglob("*")
+                           if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+                           and str(p).lower() not in known
+                           and not any(s.startswith(".") for s in p.relative_to(folder).parts))
         except OSError as e:
             self._push(f"[!] can't read {folder}: {e}")
             return
@@ -1055,7 +1081,7 @@ class Api:
         return "started"
 
     def _import_worker(self, vids, tid):
-        dest = Path(self.tab_folder(tid))
+        dest = self.drop_dir(tid)
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
         ok = 0
         for src in vids:
@@ -1110,7 +1136,9 @@ class Api:
     # --- history ---
 
     def get_history(self):
-        return [{**e, "thumb": entry_thumb(e), "exists": Path(e.get("path", "")).exists()}
+        return [{**e, "thumb": entry_thumb(e),
+                 "rel": rel_dir(e.get("path", ""), self.tab_folder(e.get("tab") or DOWNLOADS_TAB)),
+                 "exists": Path(e.get("path", "")).exists()}
                 for e in self.history]
 
     def get_pending(self):
@@ -1128,7 +1156,9 @@ class Api:
                    duration=e["duration"], size=e["size_h"], format=e["format"],
                    thumb=entry_thumb(e), path=e["path"], ts=e.get("ts"),
                    released=e.get("released"), source=e.get("source"),
-                   tab=e.get("tab") or DOWNLOADS_TAB)
+                   tab=e.get("tab") or DOWNLOADS_TAB,
+                   rel=rel_dir(e.get("path", ""),
+                               self.tab_folder(e.get("tab") or DOWNLOADS_TAB)))
 
     def play(self, key):
         for e in self.history:
@@ -1864,6 +1894,25 @@ svg{flex:none;}
   transition:color .18s var(--ease),background .18s var(--ease);}
 #sortdir:hover{color:var(--tx);background:var(--s2);}
 
+/* ---------- sub-folders inside a library ---------- */
+#folders{display:none;flex-wrap:wrap;gap:9px;padding:0 22px 14px;flex:none;}
+#folders.on{display:flex;}
+.fold{display:inline-flex;align-items:center;gap:9px;height:42px;padding:0 14px 0 11px;
+  border:1px solid var(--line);border-radius:var(--r-md);background:var(--s1);color:var(--tx);
+  cursor:pointer;font:600 12.5px/1 inherit;max-width:250px;
+  transition:background .18s var(--ease),border-color .18s var(--ease),transform .18s var(--ease);}
+.fold:hover{background:var(--s3);border-color:var(--line2);transform:translateY(-1px);}
+.fold svg{color:var(--ac);}
+.fold .fnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fold .fct{font-size:10.5px;font-weight:650;color:var(--dim);background:var(--s4);
+  padding:2px 6px;border-radius:99px;font-variant-numeric:tabular-nums;}
+.crumb{display:inline-flex;align-items:center;gap:4px;}
+.crumb button{border:none;background:transparent;color:var(--mut);cursor:pointer;
+  font:12px/1 inherit;padding:3px 5px;border-radius:6px;}
+.crumb button:hover{background:var(--s2);color:var(--tx);}
+.crumb button.here{color:var(--tx);font-weight:640;cursor:default;}
+.crumb .sep{color:var(--dim);opacity:.6;font-size:11px;}
+
 /* ================= grid ================= */
 #grid{flex:1;min-height:0;overflow-y:auto;display:grid;
   grid-template-columns:repeat(auto-fill,minmax(214px,1fr));grid-auto-rows:max-content;
@@ -2121,6 +2170,8 @@ svg{flex:none;}
     </div>
   </section>
 
+  <div id="folders"></div>
+
   <div id="grid">
     <div class="empty" id="empty">
       <span class="emptyic" id="empty-ic"></span>
@@ -2251,7 +2302,8 @@ function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").
 function toggleConsole(){document.getElementById("console").classList.toggle("open");}
 
 /* ================= libraries ================= */
-var activeTab="downloads",dlFolder="",allTabs=[{id:"downloads",name:"Downloads",builtin:true}];
+var activeTab="downloads",curPath="",dlFolder="";
+var allTabs=[{id:"downloads",name:"Downloads",builtin:true}];
 function tabOf(c){return c.tab||"downloads";}
 function tabById(id){
   for(var i=0;i<allTabs.length;i++)if(allTabs[i].id===id)return allTabs[i];
@@ -2274,7 +2326,7 @@ function renderTabs(list){
   });
 }
 function switchTab(id){
-  activeTab=id;
+  activeTab=id;curPath="";
   try{pywebview.api.set_tab(id);}catch(e){}
   var t=tabById(id);
   document.getElementById("libtitle").textContent=t.name;
@@ -2291,11 +2343,29 @@ function renderSub(){
   var t=tabById(activeTab),sub=document.getElementById("libsub");
   if(!sub)return;
   sub.innerHTML="";
-  var path=t.builtin?dlFolder:(t.folder||"");
+  var root=t.builtin?dlFolder:(t.folder||"");
+  var path=curPath?root+"/"+curPath:root;
   var p=document.createElement("span");
   p.className="fpath";p.title=path;
   p.innerHTML=ic("folder",12)+"<span>"+esc(path)+"</span>";
   sub.appendChild(p);
+  if(curPath){                      // breadcrumb back to the library root
+    var cr=document.createElement("span");cr.className="crumb";
+    var segs=curPath.split("/"),html=[];
+    var rootb=document.createElement("button");
+    rootb.textContent=t.name;rootb.onclick=function(){goPath("");};
+    cr.appendChild(rootb);
+    segs.forEach(function(s,i){
+      var sep=document.createElement("span");sep.className="sep";sep.textContent="/";
+      cr.appendChild(sep);
+      var b=document.createElement("button");
+      b.textContent=s;
+      if(i===segs.length-1){b.className="here";}
+      else{var to=segs.slice(0,i+1).join("/");b.onclick=function(){goPath(to);};}
+      cr.appendChild(b);
+    });
+    sub.appendChild(cr);
+  }
   if(t.builtin){
     sub.appendChild(hbtn("edit","Change download folder",pickDir));
   }else{
@@ -2368,6 +2438,43 @@ function bucket(c){
   if(ACTIVE[c.status])return "active";
   return "done";
 }
+function relOf(c){return c.rel||"";}
+/* videos stay in the folder they live in: only this level is listed, and the
+   sub-folders below it become tiles you can open */
+function inThisFolder(c){return relOf(c)===curPath;}
+function underCurrent(r){
+  if(!curPath)return r;
+  if(r===curPath)return "";
+  return r.indexOf(curPath+"/")===0?r.slice(curPath.length+1):null;
+}
+function goPath(rel){
+  curPath=rel||"";
+  try{pywebview.api.set_path(curPath);}catch(e){}
+  renderSub();refreshView();
+}
+function renderFolders(){
+  var box=document.getElementById("folders");if(!box)return;
+  var counts={};
+  for(var k in cards){
+    var c=cards[k];
+    if(tabOf(c)!==activeTab)continue;
+    var rest=underCurrent(relOf(c));
+    if(rest===null||rest==="")continue;
+    var first=rest.split("/")[0];
+    counts[first]=(counts[first]||0)+1;
+  }
+  var names=Object.keys(counts).sort(function(a,b){return a.localeCompare(b);});
+  box.innerHTML="";
+  box.classList.toggle("on",names.length>0);
+  names.forEach(function(n){
+    var b=document.createElement("button");
+    b.className="fold";b.title=n;
+    b.innerHTML=ic("folder",15)+'<span class="fnm">'+esc(n)+'</span>'+
+                '<span class="fct">'+counts[n]+"</span>";
+    b.onclick=function(){goPath(curPath?curPath+"/"+n:n);};
+    box.appendChild(b);
+  });
+}
 function refreshView(){
   var n={all:0,active:0,done:0,failed:0},shown=0,per={};
   var nodes=gridEl.querySelectorAll(".gc");
@@ -2376,7 +2483,9 @@ function refreshView(){
     per[t]=(per[t]||0)+1;
     var mine=t===activeTab;
     if(mine){n.all++;n[b]++;}
-    var hit=mine&&(curFilter==="all"||curFilter===b)&&
+    // a search looks through the whole library; otherwise stay in this folder
+    var here=curQuery?underCurrent(relOf(c))!==null:inThisFolder(c);
+    var hit=mine&&here&&(curFilter==="all"||curFilter===b)&&
             (!curQuery||(c.title||"").toLowerCase().indexOf(curQuery)!==-1);
     el.classList.toggle("hide",!hit);
     if(hit)shown++;
@@ -2386,6 +2495,7 @@ function refreshView(){
   });
   var lc=document.querySelectorAll("#tabbar .lt .lcnt");
   for(var j=0;j<lc.length&&j<allTabs.length;j++)lc[j].textContent=per[allTabs[j].id]||0;
+  renderFolders();
   var t2=tabById(activeTab);
   var sc=document.getElementById("subcount");
   if(sc)sc.textContent=shown+(shown===1?" video":" videos");
@@ -2395,6 +2505,10 @@ function refreshView(){
     var t=document.getElementById("empty-t"),ss=document.getElementById("empty-s");
     document.getElementById("empty-ic").innerHTML=ic(t2.builtin?"down":"film",26);
     if(curQuery){t.textContent="No matches";ss.textContent='Nothing here matches "'+curQuery+'"';}
+    else if(curPath){t.textContent="Nothing in this folder";
+      ss.textContent=document.getElementById("folders").classList.contains("on")
+        ? "Open a sub-folder above, or drop videos here to add them to "+curPath
+        : "Drop videos here to add them to "+curPath;}
     else if(!t2.builtin){t.textContent="Nothing in "+t2.name+" yet";
       ss.textContent="Drop video files here, or use the re-scan button next to the folder above";}
     else if(curFilter==="active"){t.textContent="Nothing downloading";ss.textContent="Queued and in-progress downloads show up here";}
@@ -2427,8 +2541,9 @@ function showDrop(on){
   var d=document.getElementById("drop");if(!d)return;
   if(on){
     var tb=tabById(activeTab),name=tb.builtin?(allTabs[1]?allTabs[1].name:"Imported"):tb.name;
-    document.getElementById("dropto").textContent=
-      "They move to your "+name+" folder and appear under that library";
+    document.getElementById("dropto").textContent=curPath
+      ? "They move into "+curPath+" and appear in this folder"
+      : "They move to your "+name+" folder and appear under that library";
   }
   d.classList.toggle("on",!!on);
 }
@@ -2725,7 +2840,8 @@ window.addEventListener("pywebviewready",function(){
     list.slice().reverse().forEach(function(e){
       ui.item({key:e.id,status:"done",title:e.title,channel:e.channel,duration:e.duration,
                size:e.size_h,bytes:e.size,format:e.format,thumb:e.thumb,path:e.path,
-               exists:e.exists,ts:e.ts,released:e.released,source:e.source,tab:e.tab});
+               exists:e.exists,ts:e.ts,released:e.released,source:e.source,tab:e.tab,
+               rel:e.rel});
     });
     return pywebview.api.get_pending();
   }).then(function(pend){

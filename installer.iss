@@ -4,7 +4,7 @@
 ; Build needs: dist\YTGrab\ (onedir).
 ; Build: iscc installer.iss
 #define AppName "YTGrab"
-#define AppVersion "1.9.1"
+#define AppVersion "1.10.0"
 #define AppExe "YTGrab.exe"
 
 [Setup]
