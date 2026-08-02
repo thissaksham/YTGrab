@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.7.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.8.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -676,7 +676,7 @@ def build_entry(info, target, vid):
         "format": fmt_label(info, target),
         "size": size, "size_h": human_size(size),
         "thumb": thumb, "path": str(target), "ts": time.time(),
-        "released": epoch_from_info(info) or 0,
+        "released": epoch_from_info(info) or 0, "tab": "downloads",
     }
 
 
@@ -744,10 +744,23 @@ def yt_args(url):
     return []
 
 
+DOWNLOADS_TAB = "downloads"   # built-in library tab; the rest are folder-backed
+DEFAULT_TABS = [{"id": "imported", "name": "Imported", "folder": ""}]
+
+
 class Api:
     def __init__(self):
         self.cfg = load_config()
         self.history = load_history()
+        self.tabs = self.cfg.get("tabs") or [dict(t) for t in DEFAULT_TABS]
+        self.active_tab = DOWNLOADS_TAB
+        migrated = False
+        for e in self.history:     # entries predating tabs: sort them into one
+            if not e.get("tab"):
+                e["tab"] = "imported" if e.get("source") == "local" else DOWNLOADS_TAB
+                migrated = True
+        if migrated:
+            save_history(self.history)
         self.proc = None
         self.busy = False
         self.logged_in = False
@@ -898,11 +911,104 @@ class Api:
             self.import_paths(list(res))
         return "ok"
 
+    # --- library tabs ---
+
+    def get_tabs(self):
+        return [dict(t, folder=self.tab_folder(t["id"])) for t in self.tabs]
+
+    def tab_folder(self, tid):
+        """Folder a tab points at. Blank/built-in falls back to the download dir."""
+        if tid and tid != DOWNLOADS_TAB:
+            t = next((x for x in self.tabs if x["id"] == tid), None)
+            if t and t.get("folder"):
+                return t["folder"]
+        return self.download_dir()
+
+    def set_tab(self, tid):
+        """JS tells us which tab is showing, so a drop lands in the right folder."""
+        self.active_tab = tid or DOWNLOADS_TAB
+        return "ok"
+
+    def add_tab(self):
+        """New tab pointing at a folder the user picks; indexes what's already there."""
+        fd = getattr(webview, "FileDialog", None)
+        res = UI_WIN.create_file_dialog(fd.FOLDER if fd else webview.FOLDER_DIALOG)
+        if not res:
+            return self.get_tabs()
+        folder = res[0]
+        if any(Path(t.get("folder") or "") == Path(folder) for t in self.tabs):
+            self._push("[tab] a tab for that folder already exists")
+            return self.get_tabs()
+        tid = "t-" + os.urandom(4).hex()
+        self.tabs.append({"id": tid, "name": Path(folder).name or folder, "folder": folder})
+        self.cfg["tabs"] = self.tabs
+        save_config(self.cfg)
+        self._push(f"[tab] added '{Path(folder).name}' -> {folder}")
+        threading.Thread(target=self._scan_worker, args=(tid,), daemon=True).start()
+        return self.get_tabs()
+
+    def rename_tab(self, tid, name):
+        t = next((x for x in self.tabs if x["id"] == tid), None)
+        if not t or not (name or "").strip():
+            return self.get_tabs()
+        t["name"] = name.strip()[:40]
+        self.cfg["tabs"] = self.tabs
+        save_config(self.cfg)
+        return self.get_tabs()
+
+    def remove_tab(self, tid):
+        """Drop the tab and its catalogue entries. Files on disk are untouched."""
+        self.tabs = [t for t in self.tabs if t["id"] != tid]
+        self.cfg["tabs"] = self.tabs
+        save_config(self.cfg)
+        gone = [e["id"] for e in self.history if e.get("tab") == tid]
+        self.history = [e for e in self.history if e.get("tab") != tid]
+        save_history(self.history)
+        for k in gone:
+            self._drop(k)
+        self.active_tab = DOWNLOADS_TAB
+        self._push(f"[tab] removed tab ({len(gone)} entries de-listed; files kept)")
+        return self.get_tabs()
+
+    def scan_tab(self, tid):
+        """Index videos sitting in the tab's folder that aren't catalogued yet."""
+        threading.Thread(target=self._scan_worker, args=(tid,), daemon=True).start()
+        return "started"
+
+    def _scan_worker(self, tid):
+        folder = Path(self.tab_folder(tid))
+        known = {(e.get("path") or "").lower() for e in self.history}
+        try:
+            files = [p for p in sorted(folder.iterdir())
+                     if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+                     and str(p).lower() not in known]
+        except OSError as e:
+            self._push(f"[!] can't read {folder}: {e}")
+            return
+        if not files:
+            self._push(f"[tab] nothing new in {folder}")
+            return
+        self._push(f"[tab] indexing {len(files)} video(s) in {folder}")
+        THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            key = "local-" + os.urandom(5).hex()
+            try:
+                self._item(key=key, status="processing", phase="Indexing",
+                           title=f.stem, tab=tid)
+                self._index_file(f, key, tid)
+            except Exception as e:
+                self._push(f"[!] index failed for {f.name}: {e}")
+                self._item(key=key, status="failed", title=f.stem, tab=tid)
+        self._resort()
+
     # --- local import ---
 
-    def import_paths(self, paths):
-        """Add local videos to the library: move each into the download folder
-        (unless it already lives there) and record it in history."""
+    def import_paths(self, paths, tid=None):
+        """Add local videos: move each into the active tab's folder (unless it
+        already lives there) and catalogue it under that tab."""
+        tid = tid or self.active_tab
+        if tid == DOWNLOADS_TAB:      # dropping on Downloads files it under Imported
+            tid = self.tabs[0]["id"] if self.tabs else "imported"
         vids, skipped = [], 0
         for p in paths or []:
             q = Path(p)
@@ -914,36 +1020,43 @@ class Api:
             self._push(f"[import] ignored {skipped} non-video item(s)")
         if not vids:
             return "none"
-        threading.Thread(target=self._import_worker, args=(vids,), daemon=True).start()
+        threading.Thread(target=self._import_worker, args=(vids, tid), daemon=True).start()
         return "started"
 
-    def _import_worker(self, vids):
-        dl_dir = Path(self.download_dir())
+    def _import_worker(self, vids, tid):
+        dest = Path(self.tab_folder(tid))
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
         ok = 0
         for src in vids:
             key = "local-" + os.urandom(5).hex()
             try:
                 self._item(key=key, status="processing", phase="Importing",
-                           title=src.stem)
-                ok += 1 if self._import_one(src, dl_dir, key) else 0
+                           title=src.stem, tab=tid)
+                ok += 1 if self._import_one(src, dest, key, tid) else 0
             except Exception as e:
                 self._push(f"[!] import failed for {src.name}: {e}")
-                self._item(key=key, status="failed", title=src.stem)
+                self._item(key=key, status="failed", title=src.stem, tab=tid)
         self._push(f"[+] imported {ok} of {len(vids)} file(s)")
+        self._resort()
+
+    def _resort(self):
         if UI_WIN:
             try:
-                UI_WIN.evaluate_js("sortGrid(curSort)")
+                UI_WIN.evaluate_js("sortGrid(curSort);refreshView();")
             except Exception:
                 pass
 
-    def _import_one(self, src, dl_dir, key):
-        already = src.parent.resolve() == dl_dir.resolve()
-        target = src if already else unique_path(dl_dir / src.name)
+    def _import_one(self, src, dest, key, tid):
+        already = src.parent.resolve() == dest.resolve()
+        target = src if already else unique_path(dest / src.name)
         if not already:
             self._item(key=key, status="processing", phase="Moving")
+            dest.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(target))
-            self._push(f"[import] moved {src.name} -> {dl_dir}")
+            self._push(f"[import] moved {src.name} -> {dest}")
+        return self._index_file(target, key, tid)
+
+    def _index_file(self, target, key, tid):
         self._item(key=key, status="processing", phase="Reading video")
         meta = ffprobe_meta(target)
         tf = THUMB_DIR / f"{key}.jpg"
@@ -954,6 +1067,7 @@ class Api:
         h = meta.get("height")
         self._add_history({
             "id": key, "title": target.stem, "channel": "", "source": "local",
+            "tab": tid,
             "duration": fmt_dur(meta["duration"]) if meta.get("duration") else "",
             "format": (f"{h}p " if h else "") + target.suffix.lstrip(".").lower(),
             "size": st.st_size, "size_h": human_size(st.st_size),
@@ -982,7 +1096,8 @@ class Api:
         self._item(key=e["id"], status="done", title=e["title"], channel=e["channel"],
                    duration=e["duration"], size=e["size_h"], format=e["format"],
                    thumb=entry_thumb(e), path=e["path"], ts=e.get("ts"),
-                   released=e.get("released"), source=e.get("source"))
+                   released=e.get("released"), source=e.get("source"),
+                   tab=e.get("tab") or DOWNLOADS_TAB)
 
     def play(self, key):
         for e in self.history:
@@ -1630,6 +1745,30 @@ svg{flex:none;}
 .btn.dl:hover:not(:disabled){background:var(--ac-h);}
 .btn.dl:active:not(:disabled){transform:scale(.975);}
 
+/* ---------- library tabs (top level) ---------- */
+.tabbar{display:flex;align-items:flex-end;gap:2px;flex:none;border-bottom:1px solid var(--line);
+  overflow-x:auto;overflow-y:hidden;scrollbar-width:none;}
+.tabbar::-webkit-scrollbar{display:none;}
+.ltab{position:relative;display:inline-flex;align-items:center;gap:7px;height:36px;padding:0 14px;
+  border:none;background:transparent;color:var(--mut);cursor:pointer;white-space:nowrap;
+  font:550 13px/1 inherit;border-radius:var(--r-sm) var(--r-sm) 0 0;
+  transition:color .18s var(--ease),background .18s var(--ease);}
+.ltab:hover{color:var(--tx);background:var(--s1);}
+.ltab.on{color:var(--tx);}
+.ltab.on::after{content:"";position:absolute;left:10px;right:10px;bottom:-1px;height:2px;
+  background:var(--ac);border-radius:2px 2px 0 0;}
+.ltab svg{color:var(--dim);}
+.ltab.on svg{color:var(--ac);}
+.lcnt{font-size:10.5px;font-weight:650;color:var(--dim);background:var(--s3);
+  padding:2px 6px;border-radius:99px;font-variant-numeric:tabular-nums;}
+.ltab.on .lcnt{background:var(--ac-soft);color:var(--ac-dim);}
+.taddx{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;
+  margin:0 0 3px 4px;border:1px dashed var(--line2);border-radius:var(--r-sm);background:transparent;
+  color:var(--dim);cursor:pointer;flex:none;transition:color .18s var(--ease),border-color .18s var(--ease);}
+.taddx:hover{color:var(--ac);border-color:var(--ac);}
+.folderbar{display:none;align-items:center;gap:var(--sp-2);}
+.folderbar.on{display:flex;}
+
 /* ---------- library toolbar ---------- */
 .libbar{display:flex;align-items:center;gap:var(--sp-2);flex:none;flex-wrap:wrap;}
 .tabs{display:flex;gap:var(--sp-1);background:var(--s1);border:1px solid var(--line);
@@ -1870,13 +2009,27 @@ svg{flex:none;}
     <span id="dlLabel">Download</span></button>
 </section>
 
+<nav class="tabbar" id="tabbar" role="tablist" aria-label="Libraries"></nav>
+
 <section class="libbar">
-  <div class="tabs" role="tablist" aria-label="Filter downloads">
+  <div class="tabs" id="filtertabs" role="tablist" aria-label="Filter downloads">
     <button class="tab on" role="tab" aria-selected="true" data-f="all" onclick="pickFilter('all')">All <span class="cnt" id="c-all">0</span></button>
     <button class="tab" role="tab" aria-selected="false" data-f="active" onclick="pickFilter('active')">Active <span class="cnt" id="c-active">0</span></button>
     <button class="tab" role="tab" aria-selected="false" data-f="done" onclick="pickFilter('done')">Done <span class="cnt" id="c-done">0</span></button>
-    <button class="tab" role="tab" aria-selected="false" data-f="imported" onclick="pickFilter('imported')">Imported <span class="cnt" id="c-imported">0</span></button>
     <button class="tab" role="tab" aria-selected="false" data-f="failed" onclick="pickFilter('failed')">Failed <span class="cnt" id="c-failed">0</span></button>
+  </div>
+  <div class="folderbar" id="folderbar">
+    <button class="sbtn" id="tabpath" onclick="pywebview.api.scan_tab(activeTab)"
+            title="Re-scan this folder for new videos">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      <b id="tabfolder"></b>
+    </button>
+    <button class="sbtn" onclick="removeTab()" title="Remove this tab (files are kept)"
+            aria-label="Remove this tab">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
   </div>
   <span class="sp"></span>
   <div class="searchwrap">
@@ -1936,7 +2089,7 @@ svg{flex:none;}
     <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
       stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
     <b>Drop videos to add them</b>
-    <span>They move to your download folder and join your library under Imported</span>
+    <span id="dropto">They move to your Imported folder and appear under that tab</span>
   </div>
 </div>
 
@@ -2015,6 +2168,7 @@ var P={
  alert:'<path d="M12 3 2 20h20z"/><path d="M12 10v4"/><path d="M12 17h.01"/>',
  retry:'<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
  x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+ plus:'<path d="M12 5v14"/><path d="M5 12h14"/>',
  up:'<path d="M12 20V5"/><path d="m6 11 6-6 6 6"/>',
  down:'<path d="M12 4v15"/><path d="m6 13 6 6 6-6"/>'
 };
@@ -2033,35 +2187,93 @@ function lineClass(t){
 function setStat(el,label,cls){el.className="stat "+cls;el.innerHTML='<span class="dot"></span>'+label;}
 function toggleConsole(){document.getElementById("console").classList.toggle("open");}
 
+/* ---- library tabs ---- */
+var activeTab="downloads",allTabs=[{id:"downloads",name:"Downloads",builtin:true}];
+function tabOf(c){return c.tab||"downloads";}
+function tabById(id){
+  for(var i=0;i<allTabs.length;i++)if(allTabs[i].id===id)return allTabs[i];
+  return allTabs[0];
+}
+function renderTabs(list){
+  allTabs=[{id:"downloads",name:"Downloads",builtin:true}].concat(list||[]);
+  if(!tabById(activeTab)||tabById(activeTab).id!==activeTab)activeTab="downloads";
+  var counts={};
+  for(var k in cards){var t=tabOf(cards[k]);counts[t]=(counts[t]||0)+1;}
+  var bar=document.getElementById("tabbar");bar.innerHTML="";
+  allTabs.forEach(function(t){
+    var b=document.createElement("button");
+    b.className="ltab"+(t.id===activeTab?" on":"");
+    b.setAttribute("role","tab");
+    b.setAttribute("aria-selected",t.id===activeTab?"true":"false");
+    if(t.folder)b.title=t.folder;
+    b.innerHTML=ic(t.builtin?"down":"folder",14)+"<span>"+esc(t.name)+
+                '</span><span class="lcnt">'+(counts[t.id]||0)+"</span>";
+    b.onclick=function(){switchTab(t.id);};
+    bar.appendChild(b);
+  });
+  var add=document.createElement("button");
+  add.className="taddx";add.title="Add a tab for a folder";
+  add.setAttribute("aria-label","Add a folder tab");
+  add.innerHTML=ic("plus",15);
+  add.onclick=addTab;
+  bar.appendChild(add);
+}
+function switchTab(id){
+  activeTab=id;
+  try{pywebview.api.set_tab(id);}catch(e){}
+  var folder=tabById(id).builtin?null:tabById(id).folder;
+  document.getElementById("filtertabs").style.display=folder?"none":"flex";
+  document.getElementById("folderbar").classList.toggle("on",!!folder);
+  if(folder)document.getElementById("tabfolder").textContent=folder;
+  renderTabs(allTabs.slice(1));
+  refreshView();
+}
+function addTab(){
+  pywebview.api.add_tab().then(function(list){renderTabs(list);
+    if(list&&list.length)switchTab(list[list.length-1].id);});
+}
+function removeTab(){
+  var t=tabById(activeTab);
+  if(t.builtin)return;
+  if(!confirm('Remove the "'+t.name+'" tab?\n\nIts videos are removed from the library only — the files stay in '+t.folder))return;
+  pywebview.api.remove_tab(t.id).then(function(list){activeTab="downloads";renderTabs(list);switchTab("downloads");});
+}
+
 /* ---- library filtering ---- */
 var curFilter="all",curQuery="";
 function bucket(c){
   if(c.status==="failed")return "failed";
   if(ACTIVE[c.status])return "active";
-  return c.source==="local"?"imported":"done";
+  return "done";
 }
 function refreshView(){
-  var n={all:0,active:0,done:0,imported:0,failed:0},shown=0;
+  var n={all:0,active:0,done:0,failed:0},shown=0,per={};
   var nodes=gridEl.querySelectorAll(".gc");
   for(var i=0;i<nodes.length;i++){
-    var el=nodes[i],c=cards[el.id.slice(2)]||{},b=bucket(c);
-    n.all++;n[b]++;
-    var hit=(curFilter==="all"||curFilter===b)&&
+    var el=nodes[i],c=cards[el.id.slice(2)]||{},b=bucket(c),t=tabOf(c);
+    per[t]=(per[t]||0)+1;
+    var mine=t===activeTab;
+    if(mine){n.all++;n[b]++;}
+    var hit=mine&&(curFilter==="all"||curFilter===b)&&
             (!curQuery||(c.title||"").toLowerCase().indexOf(curQuery)!==-1);
     el.classList.toggle("hide",!hit);
     if(hit)shown++;
   }
-  ["all","active","done","imported","failed"].forEach(function(k){
+  ["all","active","done","failed"].forEach(function(k){
     var e=document.getElementById("c-"+k);if(e)e.textContent=n[k];
   });
+  var lc=document.querySelectorAll("#tabbar .ltab .lcnt");   // live per-tab totals
+  for(var j=0;j<lc.length&&j<allTabs.length;j++)lc[j].textContent=per[allTabs[j].id]||0;
   var e=document.getElementById("empty");
   if(e){
     e.style.display=shown===0?"flex":"none";
     var t=document.getElementById("empty-t"),s=document.getElementById("empty-s");
+    var tb=tabById(activeTab);
     if(curQuery){t.textContent="No matches";s.textContent='Nothing here matches "'+curQuery+'"';}
+    else if(!tb.builtin){t.textContent="Nothing in "+tb.name+" yet";
+      s.textContent="Drop video files here to add them to "+(tb.folder||"this folder");}
     else if(curFilter==="active"){t.textContent="Nothing downloading";s.textContent="Queued and in-progress downloads show up here";}
     else if(curFilter==="failed"){t.textContent="No failed downloads";s.textContent="Failures stay here until you retry or remove them";}
-    else if(curFilter==="imported"){t.textContent="Nothing imported yet";s.textContent="Drag video files onto the window to add them to your library";}
     else if(curFilter==="done"&&n.all>0){t.textContent="Nothing finished yet";s.textContent="Completed downloads land here";}
     else{t.textContent="No downloads yet";s.textContent="Paste a link above and your videos appear here";}
   }
@@ -2088,7 +2300,13 @@ function hasFiles(e){
 }
 function showDrop(on){
   dragDepth=on?dragDepth:0;
-  var d=document.getElementById("drop");if(d)d.classList.toggle("on",!!on);
+  var d=document.getElementById("drop");if(!d)return;
+  if(on){
+    var tb=tabById(activeTab),name=tb.builtin?(allTabs[1]?allTabs[1].name:"Imported"):tb.name;
+    document.getElementById("dropto").textContent=
+      "They move to your "+name+" folder and appear under that tab";
+  }
+  d.classList.toggle("on",!!on);
 }
 window.addEventListener("dragenter",function(e){
   if(!hasFiles(e))return;
@@ -2370,11 +2588,12 @@ window.addEventListener("pywebviewready",function(){
     document.getElementById("ck-watched").checked=s.mark_watched!==false;
     document.getElementById("ck-stamp").checked=s.set_timestamp!==false;
   });
+  pywebview.api.get_tabs().then(function(list){renderTabs(list);switchTab("downloads");});
   pywebview.api.get_history().then(function(list){
     list.slice().reverse().forEach(function(e){
       ui.item({key:e.id,status:"done",title:e.title,channel:e.channel,duration:e.duration,
                size:e.size_h,format:e.format,thumb:e.thumb,path:e.path,exists:e.exists,
-               ts:e.ts,released:e.released,source:e.source});
+               ts:e.ts,released:e.released,source:e.source,tab:e.tab});
     });
     pywebview.api.get_pending().then(function(pend){
       pend.forEach(function(p){
