@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.13.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.13.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -301,6 +301,11 @@ def pretty_title(name):
     if len(head) < 2:                       # nothing left worth showing
         head = re.sub(r"\s{2,}", " ", s).strip()
     return head or (name or "")
+
+
+def _under(rel, folder):
+    """Is rel inside folder (or folder itself)?"""
+    return rel == folder or rel.startswith(folder + "/")
 
 
 def rel_dir(path, root):
@@ -869,6 +874,7 @@ class Api:
         self.views = self.cfg.get("views") or {}   # per-tab sort/direction/filter
         self.active_tab = DOWNLOADS_TAB
         self.active_path = ""                      # sub-folder open in that tab
+        self._trash = None                         # last removed library, for undo
         migrated = False
         for e in self.history:     # entries predating tabs: sort them into one
             if not e.get("tab"):
@@ -1137,21 +1143,84 @@ class Api:
         return out
 
     def remove_tab(self, tid):
-        """Drop the tab and its catalogue entries. Files on disk are untouched."""
+        """Drop the whole library and its catalogue entries. Files stay on disk,
+        and the removal is kept in memory so it can be undone."""
         t = next((x for x in self.tabs if x["id"] == tid), None)
         if not t or t.get("fixed"):
-            self._push("[tab] that tab is built in and can't be removed")
+            self._push("[tab] that library is built in and can't be removed")
             return self.get_tabs()
-        self.tabs = [t for t in self.tabs if t["id"] != tid]
+        removed = [e for e in self.history if e.get("tab") == tid]
+        self._trash = {"tab": dict(t), "entries": [dict(e) for e in removed],
+                       "at": self.tabs.index(t)}
+        self.tabs = [x for x in self.tabs if x["id"] != tid]
         self.cfg["tabs"] = self.tabs
         save_config(self.cfg)
-        gone = [e["id"] for e in self.history if e.get("tab") == tid]
         self.history = [e for e in self.history if e.get("tab") != tid]
         save_history(self.history)
-        for k in gone:
-            self._drop(k)
+        for e in removed:
+            self._drop(e["id"])
         self.active_tab = DOWNLOADS_TAB
-        self._push(f"[tab] removed tab ({len(gone)} entries de-listed; files kept)")
+        self._push(f"[tab] removed library '{t.get('name')}' "
+                   f"({len(removed)} videos de-listed; files kept)")
+        return self.get_tabs()
+
+    def undo_remove_tab(self):
+        """Put back the last removed library."""
+        tr = getattr(self, "_trash", None)
+        if not tr:
+            return self.get_tabs()
+        self._trash = None
+        self.tabs.insert(min(tr.get("at", len(self.tabs)), len(self.tabs)), tr["tab"])
+        self.cfg["tabs"] = self.tabs
+        save_config(self.cfg)
+        for e in tr["entries"]:
+            self.history.insert(0, e)
+        save_history(self.history)
+        for e in tr["entries"]:
+            self._add_item_from_entry(e)
+        self._push(f"[tab] restored '{tr['tab'].get('name')}'")
+        return self.get_tabs()
+
+    def _add_item_from_entry(self, e):
+        self._item(key=e["id"], status="done", title=e.get("title"),
+                   channel=e.get("channel"), duration=e.get("duration"),
+                   size=e.get("size_h"), format=e.get("format"),
+                   thumb=entry_thumb(e), path=e.get("path"), ts=e.get("ts"),
+                   released=e.get("released"), source=e.get("source"),
+                   tab=e.get("tab") or DOWNLOADS_TAB,
+                   rel=rel_dir(e.get("path", ""),
+                               self.tab_folder(e.get("tab") or DOWNLOADS_TAB)))
+
+    def hide_folder(self, tid, rel):
+        """Take one sub-folder out of a library's view. Files are untouched and
+        re-scans skip it until it's un-hidden."""
+        rel = (rel or "").strip("/")
+        t = next((x for x in self.tabs if x["id"] == tid), None)
+        if not t or not rel:
+            return {"tabs": self.get_tabs(), "n": 0}
+        ex = [x for x in (t.get("excluded") or []) if x != rel]
+        ex.append(rel)
+        t["excluded"] = ex
+        self.cfg["tabs"] = self.tabs
+        save_config(self.cfg)
+        root = self.tab_folder(tid)
+        gone = [e for e in self.history
+                if e.get("tab") == tid and _under(rel_dir(e.get("path", ""), root), rel)]
+        self.history = [e for e in self.history if e not in gone]
+        save_history(self.history)
+        for e in gone:
+            self._drop(e["id"])
+        self._push(f"[tab] hid '{rel}' ({len(gone)} videos de-listed; files kept)")
+        return {"tabs": self.get_tabs(), "n": len(gone)}
+
+    def unhide_all(self, tid):
+        t = next((x for x in self.tabs if x["id"] == tid), None)
+        if t:
+            t["excluded"] = []
+            self.cfg["tabs"] = self.tabs
+            save_config(self.cfg)
+            self._push("[tab] hidden folders restored - re-scanning")
+            threading.Thread(target=self._scan_worker, args=(tid,), daemon=True).start()
         return self.get_tabs()
 
     def scan_tab(self, tid):
@@ -1164,11 +1233,14 @@ class Api:
         each video keeps the folder it lives in (see rel_dir)."""
         folder = Path(self.tab_folder(tid))
         known = {(e.get("path") or "").lower() for e in self.history}
+        t = next((x for x in self.tabs if x["id"] == tid), None)
+        hidden = (t or {}).get("excluded") or []
         try:
             files = sorted(p for p in folder.rglob("*")
                            if p.is_file() and p.suffix.lower() in VIDEO_EXTS
                            and str(p).lower() not in known
-                           and not any(s.startswith(".") for s in p.relative_to(folder).parts))
+                           and not any(s.startswith(".") for s in p.relative_to(folder).parts)
+                           and not any(_under(rel_dir(p, folder), h) for h in hidden))
         except OSError as e:
             self._push(f"[!] can't read {folder}: {e}")
             return
@@ -2046,6 +2118,22 @@ svg{flex:none;}
 .fpath svg{color:var(--dim);}
 .subcount{color:var(--dim);}
 .subdot{color:var(--dim);opacity:.5;}
+.hactx{display:inline-flex;align-items:center;height:24px;padding:0 10px;border:none;
+  border-radius:99px;background:var(--s1);color:var(--mut);cursor:pointer;
+  font:600 11px/1 inherit;white-space:nowrap;
+  transition:background .18s var(--ease),color .18s var(--ease);}
+.hactx:hover{background:var(--s3);color:var(--tx);}
+.hactx.danger:hover{background:rgba(255,107,107,.14);color:var(--danger);}
+#toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,14px);opacity:0;
+  pointer-events:none;z-index:40;display:flex;align-items:center;gap:14px;
+  padding:12px 16px;border-radius:99px;background:rgba(22,22,30,.97);
+  border:1px solid var(--line2);color:var(--tx);font:13px/1 inherit;
+  box-shadow:0 16px 40px rgba(0,0,0,.6);backdrop-filter:blur(10px);
+  transition:opacity .2s var(--ease),transform .2s var(--ease);}
+#toast.on{opacity:1;pointer-events:auto;transform:translate(-50%,0);}
+#toast button{border:none;background:transparent;color:#FF9CC4;cursor:pointer;
+  font:700 12.5px/1 inherit;padding:2px 4px;}
+#toast button:hover{text-decoration:underline;}
 .hact{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
   border:none;border-radius:7px;background:transparent;color:var(--dim);cursor:pointer;
   transition:background .18s var(--ease),color .18s var(--ease);}
@@ -2459,6 +2547,8 @@ svg{flex:none;}
   <div id="log" role="log" aria-live="polite"></div>
 </div>
 
+<div id="toast" role="status" aria-live="polite"></div>
+
 <div id="drop">
   <div class="dropcard">
     <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
@@ -2694,17 +2784,58 @@ function renderSub(){
     });
     sub.appendChild(cr);
   }
-  if(t.builtin){
+  // actions belong to whatever you're actually looking at
+  if(t.builtin&&!curPath){
     sub.appendChild(hbtn("edit","Change download folder",pickDir));
-  }else{
+  }else if(curPath){
+    sub.appendChild(txtbtn("Hide this folder",
+      "Take "+curPath+" out of this library (the files stay on disk)",
+      function(){hideFolder(curPath);},"danger"));
+  }else if(!t.builtin){
     sub.appendChild(hbtn("retry","Re-scan this folder for new videos",function(){
       pywebview.api.scan_tab(t.id);}));
-    if(!t.fixed)sub.appendChild(hbtn("trash","Remove this library (files are kept)",
+    if(!t.fixed)sub.appendChild(txtbtn("Remove library",
+      "Remove the whole "+t.name+" library from YTGrab (the files stay on disk)",
       removeTab,"danger"));
+    var hid=(t.excluded||[]).length;
+    if(hid)sub.appendChild(txtbtn(hid+" hidden","Show hidden folders again",function(){
+      pywebview.api.unhide_all(t.id).then(function(list){renderTabs(list);renderSub();});}));
   }
   var d=document.createElement("span");d.className="subdot";d.textContent="·";
   var c=document.createElement("span");c.className="subcount";c.id="subcount";
   sub.appendChild(d);sub.appendChild(c);
+}
+function txtbtn(label,title,fn,cls){
+  var b=document.createElement("button");
+  b.className="hactx "+(cls||"");b.title=title;b.textContent=label;b.onclick=fn;
+  return b;
+}
+function hideFolder(rel){
+  var t=tabById(activeTab);
+  if(!confirm('Hide "'+rel+'" from the '+t.name+" library?\n\n"+
+              "It disappears from YTGrab only — the folder and its files stay on disk. "+
+              'You can bring it back with "hidden" next to the library name.'))return;
+  pywebview.api.hide_folder(t.id,rel).then(function(r){
+    renderTabs((r.tabs||[]).slice(1));
+    goPath(rel.indexOf("/")!==-1?rel.slice(0,rel.lastIndexOf("/")):"");
+    toast("Hid "+rel+" ("+r.n+" videos de-listed)");
+  });
+}
+/* brief message with an optional action, for things that need an undo */
+var toastT=null;
+function toast(msg,actionLabel,action){
+  var el=document.getElementById("toast");
+  el.innerHTML="";
+  var s=document.createElement("span");s.textContent=msg;el.appendChild(s);
+  if(actionLabel){
+    var b=document.createElement("button");
+    b.textContent=actionLabel;
+    b.onclick=function(){el.classList.remove("on");action();};
+    el.appendChild(b);
+  }
+  el.classList.add("on");
+  clearTimeout(toastT);
+  toastT=setTimeout(function(){el.classList.remove("on");},actionLabel?9000:4000);
 }
 function hbtn(icon,title,fn,cls){
   var b=document.createElement("button");
@@ -2724,9 +2855,16 @@ function addTab(){
 function removeTab(){
   var t=tabById(activeTab);
   if(t.builtin||t.fixed)return;
-  if(!confirm('Remove the "'+t.name+'" library?\n\nIt is only removed from YTGrab — your files stay in '+t.folder))return;
+  if(!confirm('Remove the whole "'+t.name+'" library?\n\n'+
+              "Every video in it is de-listed from YTGrab (the files stay in "+t.folder+").\n\n"+
+              'To hide just one folder, open that folder and use "Hide this folder" instead.'))return;
   pywebview.api.remove_tab(t.id).then(function(list){
     activeTab="downloads";renderTabs(list);switchTab("downloads");
+    toast('Removed the "'+t.name+'" library',"Undo",function(){
+      pywebview.api.undo_remove_tab().then(function(l){
+        renderTabs(l);switchTab(t.id);
+      });
+    });
   });
 }
 
