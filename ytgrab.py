@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.10.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.11.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -200,6 +200,47 @@ def entry_thumb(e):
         return "data:image/jpeg;base64," + base64.b64encode(Path(tf).read_bytes()).decode()
     except OSError:
         return ""
+
+
+DOWNLOADS_TAB = "downloads"   # built-in library tab; the rest are folder-backed
+DOWNLOADS_NAME = "YT Downloads"
+# 'fixed' tabs ship with the app and cannot be removed
+DEFAULT_TABS = [{"id": "imported", "name": "Imported", "folder": "", "fixed": True}]
+
+
+def site_name(host):
+    """'www.sonyliv.com' -> 'Sonyliv'; used to name a site's own library."""
+    h = re.sub(r"^(www|m|web)\.", "", (host or "").lower())
+    label = h.split(".")[0] if h else "Other"
+    return re.sub(r"[^A-Za-z0-9 ]", "", label).title() or "Other"
+
+
+# everything from the first of these markers onward is release noise, not a title
+RE_REL_CUT = re.compile(
+    r"\b(?:\d{3,4}p|4k|uhd|hdr10\+?|hdr|sdr|10bit|8bit|web[- ]?dl|web[- ]?rip|webrip|"
+    r"blu[- ]?ray|bluray|b[rd]rip|hdrip|dvdrip|hdtv|hdcam|camrip|"
+    r"x26[45]|h\.?26[45]|hevc|avc1?|xvid|divx|"
+    r"aac|ac3|eac3|ddp?\d|dts(?:[- ]?hd)?|atmos|truehd|"
+    r"dual[- ]?audio|multi(?:sub)?|esubs?|msubs?|repack|proper|remastered|"
+    r"amzn|dsnp|nf|hmax|sonyliv|zee5|jio|yts|yify|rarbg|psa|galaxyrg|moviesleech|"
+    r"tgx|ettv|eztv|hq|hd)\b", re.I)
+RE_BRACKETS = re.compile(r"[\[\(\{][^\]\)\}]*[\]\)\}]")
+
+
+def pretty_title(name):
+    """'Heartstopper.Forever.2026.1080p.WEBRip.x264[YTS.GG]' -> 'Heartstopper Forever 2026'.
+    Falls back to the tidied name when nothing looks like release noise."""
+    s = re.sub(r"\.(mkv|mp4|avi|webm|mov|m4v|flv|ts)$", "", name or "", flags=re.I)
+    s = re.sub(r"[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]", r" \1 ", s)   # keep (2014)
+    s = RE_BRACKETS.sub(" ", s)
+    s = s.replace("_", " ").replace(".", " ")
+    m = RE_REL_CUT.search(s)
+    head = s[:m.start()] if m else s
+    head = re.sub(r"[\s\-–—_]+$", "", head).strip()
+    head = re.sub(r"\s{2,}", " ", head)
+    if len(head) < 2:                       # nothing left worth showing
+        head = re.sub(r"\s{2,}", " ", s).strip()
+    return head or (name or "")
 
 
 def rel_dir(path, root):
@@ -674,7 +715,7 @@ def build_vformats(data):
         return []
 
 
-def build_entry(info, target, vid):
+def build_entry(info, target, vid, tab=DOWNLOADS_TAB):
     thumb = (f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
              if len(vid) == 11 else (info.get("thumbnail") or ""))
     size = target.stat().st_size
@@ -686,11 +727,11 @@ def build_entry(info, target, vid):
         "format": fmt_label(info, target),
         "size": size, "size_h": human_size(size),
         "thumb": thumb, "path": str(target), "ts": time.time(),
-        "released": epoch_from_info(info) or 0, "tab": "downloads",
+        "released": epoch_from_info(info) or 0, "tab": tab,
     }
 
 
-def postprocess(dl_dir, started, api, mark=True, stamp=True):
+def postprocess(dl_dir, started, api, mark=True, stamp=True, tab=DOWNLOADS_TAB):
     """For each fresh .info.json: optionally stamp the file date and mark it
     watched (with live phase updates), record a history entry, delete the json.
     Returns the list of history entries built."""
@@ -716,7 +757,7 @@ def postprocess(dl_dir, started, api, mark=True, stamp=True):
                 api._item(key=vid, status="processing", phase="Marking watched")
                 browser_mark_watched(url, push)
             if target:
-                entries.append(build_entry(info, target, vid))
+                entries.append(build_entry(info, target, vid, tab))
             jf.unlink(missing_ok=True)
         except Exception as e:
             push(f"[post] cleanup error: {e}")
@@ -754,11 +795,6 @@ def yt_args(url):
     return []
 
 
-DOWNLOADS_TAB = "downloads"   # built-in library tab; the rest are folder-backed
-# 'fixed' tabs ship with the app and cannot be removed
-DEFAULT_TABS = [{"id": "imported", "name": "Imported", "folder": "", "fixed": True}]
-
-
 class Api:
     def __init__(self):
         self.cfg = load_config()
@@ -777,6 +813,11 @@ class Api:
         for e in self.history:     # entries predating tabs: sort them into one
             if not e.get("tab"):
                 e["tab"] = "imported" if e.get("source") == "local" else DOWNLOADS_TAB
+                migrated = True
+            # local titles used to be the raw filename; tidy them once
+            if e.get("source") == "local" and not e.get("file"):
+                e["file"] = Path(e.get("path") or e.get("title") or "").name
+                e["title"] = pretty_title(Path(e["file"]).stem or e.get("title") or "")
                 migrated = True
         if migrated:
             save_history(self.history)
@@ -936,6 +977,34 @@ class Api:
     def get_tabs(self):
         return [dict(t, folder=self.tab_folder(t["id"])) for t in self.tabs]
 
+    def site_tab(self, url):
+        """(tab_id, folder) a download from this url belongs in. YouTube keeps the
+        main download folder; every other site gets its own library + sub-folder,
+        created on first use."""
+        if is_youtube(url):
+            return DOWNLOADS_TAB, Path(self.download_dir())
+        host, _ = site_key(url)
+        if not host:
+            return DOWNLOADS_TAB, Path(self.download_dir())
+        tid = "site-" + re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")
+        t = next((x for x in self.tabs if x["id"] == tid), None)
+        if not t:
+            name = site_name(host)
+            folder = Path(self.download_dir()) / name
+            t = {"id": tid, "name": name, "folder": str(folder), "site": host}
+            self.tabs.append(t)
+            self.cfg["tabs"] = self.tabs
+            save_config(self.cfg)
+            self._push(f"[tab] new library '{name}' for {host}")
+            if UI_WIN:
+                try:
+                    UI_WIN.evaluate_js("refreshTabs()")
+                except Exception:
+                    pass
+        folder = Path(t.get("folder") or self.download_dir())
+        folder.mkdir(parents=True, exist_ok=True)
+        return t["id"], folder
+
     def tab_folder(self, tid):
         """Folder a tab points at. Blank/built-in falls back to the download dir."""
         if tid and tid != DOWNLOADS_TAB:
@@ -988,9 +1057,10 @@ class Api:
         save_config(self.cfg)
         return self.get_tabs()
 
-    def set_view(self, tid, sort, direction, filt):
+    def set_view(self, tid, sort, direction, filt, group=False):
         """Remember how each tab is sorted/filtered -- it's per library, not global."""
-        self.views[tid or DOWNLOADS_TAB] = {"sort": sort, "dir": direction, "filter": filt}
+        self.views[tid or DOWNLOADS_TAB] = {"sort": sort, "dir": direction,
+                                            "filter": filt, "group": bool(group)}
         self.cfg["views"] = self.views
         save_config(self.cfg)
         return "ok"
@@ -1123,8 +1193,8 @@ class Api:
         st = target.stat()
         h = meta.get("height")
         self._add_history({
-            "id": key, "title": target.stem, "channel": "", "source": "local",
-            "tab": tid,
+            "id": key, "title": pretty_title(target.stem), "file": target.name,
+            "channel": "", "source": "local", "tab": tid,
             "duration": fmt_dur(meta["duration"]) if meta.get("duration") else "",
             "format": (f"{h}p " if h else "") + target.suffix.lstrip(".").lower(),
             "size": st.st_size, "size_h": human_size(st.st_size),
@@ -1296,6 +1366,49 @@ class Api:
 
     # --- login ---
 
+    # --- profile ---
+
+    def get_profile(self):
+        """Signed-in sites plus dependency health, for the profile panel."""
+        sites = [{"host": "www.youtube.com", "name": "YouTube", "builtin": True,
+                  "status": "in" if self.logged_in else "out"}]
+        for s in self.cfg.get("sites") or []:
+            if "youtube" in s.get("host", ""):
+                continue
+            sites.append({"host": s["host"], "name": s.get("name") or site_name(s["host"]),
+                          "builtin": False, "status": "saved", "when": s.get("when", 0)})
+        def dep(p, label):
+            return {"name": label, "ok": p.exists(),
+                    "where": str(p) if p.exists() else "not installed"}
+        deps = [dep(YTDLP, "yt-dlp"), dep(FFMPEG, "ffmpeg"),
+                dep(FFPROBE, "ffprobe"), dep(NODE, "node (YouTube JS challenge)")]
+        return {"sites": sites, "deps": deps, "bin": str(BIN_DIR)}
+
+    def add_site(self, url):
+        """Remember a site and open its login window."""
+        u = (url or "").strip()
+        if not u:
+            return self.get_profile()
+        if not re.match(r"^https?://", u, re.I):
+            u = "https://" + u
+        host, _ = site_key(u)
+        if not host:
+            self._push("[login] that doesn't look like a website address")
+            return self.get_profile()
+        sites = [s for s in (self.cfg.get("sites") or []) if s.get("host") != host]
+        sites.append({"host": host, "name": site_name(host), "when": time.time()})
+        self.cfg["sites"] = sites
+        save_config(self.cfg)
+        self.login(u)
+        return self.get_profile()
+
+    def remove_site(self, host):
+        self.cfg["sites"] = [s for s in (self.cfg.get("sites") or [])
+                             if s.get("host") != host]
+        save_config(self.cfg)
+        self._push(f"[login] removed {host} from the signed-in list")
+        return self.get_profile()
+
     def login(self, url=""):
         host, _key = site_key((url or "").strip())
         is_yt = not host or "youtube" in host or "youtu.be" in host
@@ -1309,6 +1422,10 @@ class Api:
         else:
             def done(*a):
                 self._jar_cache.pop(_key, None)  # force re-read next use
+                sites = [s for s in (self.cfg.get("sites") or []) if s.get("host") != host]
+                sites.append({"host": host, "name": site_name(host), "when": time.time()})
+                self.cfg["sites"] = sites
+                save_config(self.cfg)
                 self._push(f"[login] {host} session saved in profile")
             w.events.closed += done
         return "opened"
@@ -1691,7 +1808,8 @@ class Api:
                     pass
             return
         started = time.time()
-        dl_dir = self.download_dir()
+        dest_tab, dest_dir = self.site_tab(url)   # non-YouTube sites get their own library
+        dl_dir = str(dest_dir)
         cmd = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
                *yt_args(url)]
         if items:
@@ -1718,7 +1836,7 @@ class Api:
 
         for k in state["items"]:
             self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))
-        entries = postprocess(dl_dir, started, self, mark, stamp)
+        entries = postprocess(dl_dir, started, self, mark, stamp, dest_tab)
         done_ids = set()
         for e in entries:
             self._add_history(e)
@@ -1877,6 +1995,19 @@ svg{flex:none;}
 .chipb.on{background:var(--s4);color:var(--tx);}
 .cnt{font-size:10px;font-weight:700;color:var(--dim);font-variant-numeric:tabular-nums;}
 .chipb.on .cnt{color:#FF9CC4;}
+.gtoggle{display:none;align-items:center;gap:7px;height:33px;padding:0 12px;border-radius:99px;
+  border:1px solid var(--line2);background:var(--s1);color:var(--mut);cursor:pointer;
+  font:600 11.5px/1 inherit;white-space:nowrap;transition:color .18s var(--ease),border-color .18s var(--ease);}
+.gtoggle.on{display:inline-flex;}
+.gtoggle:hover{color:var(--tx);}
+.gtoggle input{width:15px;height:15px;accent-color:var(--ac);cursor:pointer;flex:none;}
+.ghead{grid-column:1/-1;display:flex;align-items:center;gap:9px;padding:8px 2px 2px;
+  font:650 12.5px/1 inherit;color:var(--tx);}
+.ghead:first-child{padding-top:0;}
+.ghead svg{color:var(--ac);}
+.ghead .gcount{font-size:10.5px;font-weight:650;color:var(--dim);background:var(--s3);
+  padding:2px 7px;border-radius:99px;font-variant-numeric:tabular-nums;}
+.ghead .grule{flex:1;height:1px;background:var(--line);}
 .searchwrap{position:relative;display:flex;align-items:center;}
 .searchwrap svg{position:absolute;left:11px;color:var(--dim);pointer-events:none;}
 #q{width:168px;height:33px;border:1px solid var(--line2);border-radius:99px;background:var(--s1);
@@ -2001,6 +2132,41 @@ svg{flex:none;}
   color:#FF9CC4;text-align:center;}
 .dropcard b{font-size:17px;font-weight:680;color:var(--tx);}
 .dropcard span{font-size:12.5px;color:var(--mut);max-width:330px;}
+/* ---------- profile panel ---------- */
+#profscrim{position:fixed;inset:0;background:rgba(4,4,9,.74);opacity:0;pointer-events:none;
+  transition:opacity .2s var(--ease);z-index:21;backdrop-filter:blur(3px);}
+#profscrim.open{opacity:1;pointer-events:auto;}
+#prof{position:fixed;right:14px;top:14px;bottom:14px;width:min(400px,94vw);opacity:0;
+  pointer-events:none;transform:translateX(14px);overflow-y:auto;background:var(--s2);
+  border:1px solid var(--line2);border-radius:var(--r-xl);padding:20px;z-index:22;
+  display:flex;flex-direction:column;gap:20px;
+  transition:opacity .2s var(--ease),transform .2s var(--ease);box-shadow:-24px 0 64px rgba(0,0,0,.6);}
+#prof.open{opacity:1;pointer-events:auto;transform:none;}
+.phead{display:flex;align-items:center;gap:8px;}
+.phead h3{margin:0;font-size:17px;font-weight:680;letter-spacing:-.3px;}
+.sitelist{display:flex;flex-direction:column;gap:6px;}
+.srow{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--r-md);
+  border:1px solid var(--line);background:var(--s1);}
+.srow .sdot{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none;}
+.srow.in .sdot{background:var(--ok);box-shadow:0 0 7px rgba(61,220,151,.6);}
+.srow.out .sdot{background:var(--warn);}
+.srow .snm{flex:1;min-width:0;font:600 13px/1.3 inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.srow .sst{font-size:11px;color:var(--mut);white-space:nowrap;}
+.srow .sact{display:flex;gap:4px;}
+.sbtn2{width:26px;height:26px;border:none;border-radius:7px;background:transparent;color:var(--dim);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  transition:background .18s var(--ease),color .18s var(--ease);}
+.sbtn2:hover{background:var(--s3);color:var(--tx);}
+.sbtn2.danger:hover{color:var(--danger);}
+.addsite{display:flex;gap:7px;margin-top:3px;}
+#newsite{flex:1;min-width:0;height:38px;border:1px solid var(--line2);border-radius:var(--r-md);
+  background:var(--s1);color:var(--tx);padding:0 13px;font:13px/1 inherit;}
+#newsite:focus{outline:none;border-color:var(--ac);}
+#newsite::placeholder{color:var(--dim);}
+.tbtn.solid{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff;height:38px;
+  padding:0 16px;border-radius:var(--r-md);}
+.tbtn.solid:hover{filter:brightness(1.1);background:linear-gradient(135deg,var(--ac),var(--ac2));}
+.depfoot{display:flex;align-items:center;gap:8px;margin-top:3px;}
 #scrim{position:fixed;inset:0;background:rgba(4,4,9,.74);opacity:0;pointer-events:none;
   transition:opacity .2s var(--ease);z-index:19;backdrop-filter:blur(3px);}
 #scrim.open{opacity:1;pointer-events:auto;}
@@ -2130,8 +2296,8 @@ svg{flex:none;}
         stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
       <span class="ibadge" id="conbadge"></span>
     </button>
-    <button class="ib" id="loginbtn" title="Log into the pasted URL's site (YouTube if empty)"
-            aria-label="Log in" onclick="pywebview.api.login(document.getElementById('url').value)">
+    <button class="ib" id="loginbtn" title="Profile — signed-in sites and dependencies"
+            aria-label="Profile" onclick="openProf()">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/></svg>
       <span class="idot" id="authdot"></span>
@@ -2142,7 +2308,7 @@ svg{flex:none;}
     <div>
       <div class="libttl">
         <span class="hicon" id="libicon"></span>
-        <h2 id="libtitle">Downloads</h2>
+        <h2 id="libtitle">YT Downloads</h2>
       </div>
       <div id="libsub"></div>
     </div>
@@ -2154,6 +2320,10 @@ svg{flex:none;}
         <button class="chipb" role="tab" aria-selected="false" data-f="done" onclick="pickFilter('done')">Done <span class="cnt" id="c-done">0</span></button>
         <button class="chipb" role="tab" aria-selected="false" data-f="failed" onclick="pickFilter('failed')">Failed <span class="cnt" id="c-failed">0</span></button>
       </div>
+      <label class="gtoggle" id="grouptoggle" title="Group these videos by channel">
+        <input type="checkbox" id="ck-group" onchange="toggleGroup(this.checked)">
+        <span>Group by channel</span>
+      </label>
       <div class="searchwrap">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
           stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -2202,6 +2372,34 @@ svg{flex:none;}
       stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
     <b>Drop videos to add them</b>
     <span id="dropto">They move to your Imported folder and appear under that library</span>
+  </div>
+</div>
+
+<div id="profscrim" onclick="closeProf()"></div>
+<div id="prof" role="dialog" aria-modal="true" aria-label="Profile">
+  <div class="phead">
+    <h3>Profile</h3><span class="sp"></span>
+    <button class="cx" onclick="closeProf()" aria-label="Close">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
+  </div>
+  <div class="field">
+    <span class="slabel">SIGNED-IN SITES</span>
+    <div id="sitelist" class="sitelist"></div>
+    <div class="addsite">
+      <input type="text" id="newsite" placeholder="Add a site, e.g. hotstar.com" spellcheck="false"
+             aria-label="Website to sign into">
+      <button class="tbtn solid" onclick="addSite()">Sign in</button>
+    </div>
+  </div>
+  <div class="field">
+    <span class="slabel">DEPENDENCIES</span>
+    <div id="deplist" class="sitelist"></div>
+    <div class="depfoot">
+      <span id="depbin" class="msub"></span><span class="sp"></span>
+      <button class="tbtn" onclick="pywebview.api.update_deps();setTimeout(loadProfile,1200)">Check for updates</button>
+    </div>
   </div>
 </div>
 
@@ -2284,7 +2482,9 @@ var P={
  up:'<path d="M12 20V5"/><path d="m6 11 6-6 6 6"/>',
  down:'<path d="M12 4v15"/><path d="m6 13 6 6 6-6"/>',
  film:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 12h18"/>',
- edit:'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'
+ edit:'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+ login:'<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="m10 17 5-5-5-5"/><path d="M15 12H3"/>',
+ user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/>'
 };
 function ic(n,sz,cls){return '<svg class="'+(cls||'')+'" width="'+(sz||16)+'" height="'+(sz||16)+
   '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';}
@@ -2303,14 +2503,14 @@ function toggleConsole(){document.getElementById("console").classList.toggle("op
 
 /* ================= libraries ================= */
 var activeTab="downloads",curPath="",dlFolder="";
-var allTabs=[{id:"downloads",name:"Downloads",builtin:true}];
+var allTabs=[{id:"downloads",name:"YT Downloads",builtin:true}];
 function tabOf(c){return c.tab||"downloads";}
 function tabById(id){
   for(var i=0;i<allTabs.length;i++)if(allTabs[i].id===id)return allTabs[i];
   return allTabs[0];
 }
 function renderTabs(list){
-  allTabs=[{id:"downloads",name:"Downloads",builtin:true}].concat(list||[]);
+  allTabs=[{id:"downloads",name:"YT Downloads",builtin:true}].concat(list||[]);
   if(tabById(activeTab).id!==activeTab)activeTab="downloads";
   var bar=document.getElementById("tabbar");bar.innerHTML="";
   allTabs.forEach(function(t){
@@ -2383,6 +2583,10 @@ function hbtn(icon,title,fn,cls){
   b.className="hact "+(cls||"");b.title=title;b.setAttribute("aria-label",title);
   b.innerHTML=ic(icon,13);b.onclick=fn;return b;
 }
+/* Python calls this when a download creates a site library on the fly */
+function refreshTabs(){
+  pywebview.api.get_tabs().then(function(list){renderTabs(list);refreshView();});
+}
 function addTab(){
   pywebview.api.add_tab().then(function(list){
     renderTabs(list);
@@ -2399,13 +2603,16 @@ function removeTab(){
 }
 
 /* ================= per-library view state ================= */
-var views={},curSort="released",curDir=-1,curFilter="all",curQuery="";
+var views={},curSort="released",curDir=-1,curFilter="all",curQuery="",groupOn=false;
 var NAT={ts:-1,released:-1,title:1,size:-1};
 function loadView(tid){
   var v=views[tid]||{};
   curSort=v.sort||"released";
   curDir=(v.dir===1||v.dir===-1)?v.dir:(NAT[curSort]||-1);
   curFilter=v.filter||"all";
+  groupOn=!!v.group;
+  document.getElementById("ck-group").checked=groupOn;
+  document.getElementById("grouptoggle").classList.toggle("on",tabById(tid).builtin);
   curQuery="";
   document.getElementById("q").value="";
   document.getElementById("sortsel").value=curSort;
@@ -2413,8 +2620,8 @@ function loadView(tid){
   sortGrid(curSort);
 }
 function saveView(){
-  views[activeTab]={sort:curSort,dir:curDir,filter:curFilter};
-  try{pywebview.api.set_view(activeTab,curSort,curDir,curFilter);}catch(e){}
+  views[activeTab]={sort:curSort,dir:curDir,filter:curFilter,group:groupOn};
+  try{pywebview.api.set_view(activeTab,curSort,curDir,curFilter,groupOn);}catch(e){}
 }
 function syncChips(){
   var cs=document.querySelectorAll("#filtertabs .chipb");
@@ -2427,6 +2634,33 @@ function updDirIcon(){
   var b=document.getElementById("sortdir");
   if(b){b.innerHTML=ic(curDir>0?"up":"down",14);
     b.title=curDir>0?"Ascending":"Descending";}
+}
+function toggleGroup(on){
+  groupOn=!!on;
+  sortGrid(curSort);refreshView();saveView();
+}
+/* channel headings, inserted after visibility is settled so counts are honest */
+function applyGrouping(){
+  var old=gridEl.querySelectorAll(".ghead");
+  for(var i=0;i<old.length;i++)old[i].remove();
+  if(!groupOn||!tabById(activeTab).builtin)return;
+  var nodes=gridEl.querySelectorAll(".gc"),last=null,head=null,n=0;
+  function close(){if(head)head.querySelector(".gcount").textContent=n;}
+  for(var j=0;j<nodes.length;j++){
+    var el=nodes[j];
+    if(el.classList.contains("hide"))continue;
+    var c=cards[el.id.slice(2)]||{},ch=(c.channel||"Unknown channel").trim()||"Unknown channel";
+    if(ch!==last){
+      close();
+      head=document.createElement("div");head.className="ghead";
+      head.innerHTML=ic("user",14)+"<span>"+esc(ch)+'</span><span class="gcount">0</span>'+
+                     '<span class="grule"></span>';
+      gridEl.insertBefore(head,el);
+      last=ch;n=0;
+    }
+    n++;
+  }
+  close();
 }
 function pickSort(mode){curSort=mode;curDir=NAT[mode]||-1;updDirIcon();sortGrid(mode);saveView();}
 function flipDir(){curDir=-curDir;updDirIcon();sortGrid(curSort);saveView();}
@@ -2496,6 +2730,7 @@ function refreshView(){
   var lc=document.querySelectorAll("#tabbar .lt .lcnt");
   for(var j=0;j<lc.length&&j<allTabs.length;j++)lc[j].textContent=per[allTabs[j].id]||0;
   renderFolders();
+  applyGrouping();
   var t2=tabById(activeTab);
   var sc=document.getElementById("subcount");
   if(sc)sc.textContent=shown+(shown===1?" video":" videos");
@@ -2688,6 +2923,10 @@ function sortGrid(mode){
     var aa=ca.status!=="done",ba=cb.status!=="done";
     if(aa!==ba)return aa?-1:1;               // active/failed pinned on top
     if(aa)return 0;
+    if(groupOn&&tabById(activeTab).builtin){ // keep each channel's videos together
+      var ga=(ca.channel||"~").toLowerCase(),gb=(cb.channel||"~").toLowerCase();
+      if(ga!==gb)return ga<gb?-1:1;
+    }
     var base;
     if(mode==="title")base=(ca.title||"").localeCompare(cb.title||"");
     else if(mode==="released")base=(ca.released||0)-(cb.released||0);
@@ -2813,6 +3052,61 @@ function confirmDl(){
     .then(function(r){if(r==="no-deps")ui.log("[!] dependencies missing");});
 }
 function pickDir(){pywebview.api.pick_folder().then(function(d){dlFolder=d;renderSub();});}
+
+/* ================= profile ================= */
+function openProf(){
+  document.getElementById("profscrim").classList.add("open");
+  document.getElementById("prof").classList.add("open");
+  loadProfile();
+}
+function closeProf(){
+  document.getElementById("profscrim").classList.remove("open");
+  document.getElementById("prof").classList.remove("open");
+}
+function loadProfile(){
+  pywebview.api.get_profile().then(function(p){
+    var sl=document.getElementById("sitelist");sl.innerHTML="";
+    (p.sites||[]).forEach(function(s){
+      var r=document.createElement("div");
+      r.className="srow "+(s.status==="in"?"in":(s.status==="out"?"out":""));
+      var st=s.status==="in"?"Signed in":(s.status==="out"?"Not signed in":"Session saved");
+      r.innerHTML='<span class="sdot"></span><span class="snm">'+esc(s.name)+
+                  '</span><span class="sst">'+st+"</span>";
+      var acts=document.createElement("span");acts.className="sact";
+      var lg=document.createElement("button");
+      lg.className="sbtn2";lg.title="Sign in again";lg.setAttribute("aria-label","Sign into "+s.name);
+      lg.innerHTML=ic("login",14);
+      lg.onclick=function(){pywebview.api.login("https://"+s.host+"/");closeProf();};
+      acts.appendChild(lg);
+      if(!s.builtin){
+        var rm=document.createElement("button");
+        rm.className="sbtn2 danger";rm.title="Remove from this list";
+        rm.setAttribute("aria-label","Remove "+s.name);
+        rm.innerHTML=ic("trash",14);
+        rm.onclick=function(){pywebview.api.remove_site(s.host).then(showProfile);};
+        acts.appendChild(rm);
+      }
+      r.appendChild(acts);sl.appendChild(r);
+    });
+    var dl=document.getElementById("deplist");dl.innerHTML="";
+    (p.deps||[]).forEach(function(d){
+      var r=document.createElement("div");
+      r.className="srow "+(d.ok?"in":"out");
+      r.innerHTML='<span class="sdot"></span><span class="snm">'+esc(d.name)+
+                  '</span><span class="sst">'+(d.ok?"Installed":"Missing")+"</span>";
+      r.title=d.where;
+      dl.appendChild(r);
+    });
+    document.getElementById("depbin").textContent=p.bin||"";
+  });
+}
+function showProfile(p){loadProfile();}
+function addSite(){
+  var i=document.getElementById("newsite"),v=i.value.trim();
+  if(!v)return;
+  i.value="";
+  pywebview.api.add_site(v).then(function(){loadProfile();closeProf();});
+}
 document.addEventListener("keydown",function(e){
   var open=document.getElementById("dlg").classList.contains("open");
   if(e.key==="Escape"){if(open){closeDlg();}else{document.getElementById("console").classList.remove("open");}return;}
