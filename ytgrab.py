@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.9.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.9.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1770,18 +1770,6 @@ svg{flex:none;}
   color:var(--dim);cursor:pointer;font:550 12.5px/1 inherit;width:100%;
   transition:color .18s var(--ease),border-color .18s var(--ease);}
 .addlib:hover{color:var(--ac);border-color:var(--ac);}
-.sidefoot{display:flex;flex-direction:column;gap:2px;padding-top:9px;border-top:1px solid var(--line);}
-.sfbtn{display:flex;align-items:center;gap:8px;min-height:30px;padding:5px 8px;border:none;
-  border-radius:var(--r-sm);background:transparent;color:var(--mut);cursor:pointer;
-  font:11.5px/1.3 inherit;text-align:left;width:100%;transition:background .18s var(--ease);}
-.sfbtn:hover{background:var(--s2);color:var(--tx);}
-.sfbtn svg{color:var(--dim);}
-.sfbtn b{font-weight:400;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
-.statline{display:flex;gap:12px;padding:5px 9px;}
-.stat{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--mut);}
-.stat .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:none;}
-.stat.ok .dot{background:var(--ok);box-shadow:0 0 7px rgba(61,220,151,.6);}
-.stat.warn .dot{background:var(--warn);box-shadow:0 0 7px rgba(247,185,85,.55);}
 .chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--dim);}
 .chip .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:none;}
 .chip.ok .dot{background:var(--ok);} .chip.warn .dot{background:var(--warn);}
@@ -1806,10 +1794,24 @@ svg{flex:none;}
   box-shadow:0 6px 20px rgba(224,57,127,.3);}
 .btn.dl:hover:not(:disabled){filter:brightness(1.1);}
 .btn.dl:active:not(:disabled){transform:scale(.97);}
-.ib{width:38px;height:38px;border-radius:50%;border:1px solid var(--line2);background:transparent;
-  color:var(--mut);display:inline-flex;align-items:center;justify-content:center;
-  cursor:pointer;transition:background .18s var(--ease),color .18s var(--ease);}
+.ib{position:relative;width:38px;height:38px;border-radius:50%;border:1px solid var(--line2);
+  background:transparent;color:var(--mut);display:inline-flex;align-items:center;
+  justify-content:center;cursor:pointer;transition:background .18s var(--ease),color .18s var(--ease);}
 .ib:hover{background:var(--s2);color:var(--tx);}
+/* status rides on the control it belongs to, not in a far-off corner */
+.idot{position:absolute;right:1px;bottom:1px;width:9px;height:9px;border-radius:50%;
+  background:var(--warn);border:2px solid var(--bg);}
+.idot.ok{background:var(--ok);}
+.ibadge{position:absolute;right:0;top:0;min-width:16px;height:16px;padding:0 4px;display:none;
+  align-items:center;justify-content:center;border-radius:99px;background:var(--danger);
+  color:#2A0505;border:2px solid var(--bg);font:700 9.5px/1 inherit;font-variant-numeric:tabular-nums;}
+.ibadge.on{display:flex;}
+.warnpill{display:none;align-items:center;gap:7px;height:32px;padding:0 13px;border-radius:99px;
+  background:rgba(247,185,85,.13);border:1px solid rgba(247,185,85,.4);color:var(--warn);
+  font:600 11.5px/1 inherit;white-space:nowrap;}
+.warnpill.on{display:inline-flex;}
+.warnpill .spin{width:11px;height:11px;border:2px solid rgba(247,185,85,.3);
+  border-top-color:var(--warn);border-radius:50%;animation:spin .8s linear infinite;flex:none;}
 .upd{display:none;align-items:center;gap:6px;height:32px;padding:0 13px;border:none;
   border-radius:99px;background:var(--ac-soft);color:#FF9CC4;cursor:pointer;
   font:650 11.5px/1 inherit;border:1px solid rgba(224,57,127,.4);
@@ -1822,8 +1824,14 @@ svg{flex:none;}
 .libttl h2{margin:0;font-size:23px;font-weight:680;letter-spacing:-.6px;}
 .hicon{width:30px;height:30px;border-radius:9px;background:var(--s3);color:var(--ac);
   display:flex;align-items:center;justify-content:center;flex:none;}
-#libsub{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--dim);margin-top:3px;}
-#libsub .fpath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px;}
+#libsub{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);margin-top:4px;}
+.fpath{display:inline-flex;align-items:center;gap:6px;max-width:340px;min-width:0;
+  padding:3px 8px;border-radius:7px;background:var(--s1);border:1px solid var(--line);
+  color:var(--mut);font:11.5px/1 inherit;cursor:default;}
+.fpath span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fpath svg{color:var(--dim);}
+.subcount{color:var(--dim);}
+.subdot{color:var(--dim);opacity:.5;}
 .hact{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
   border:none;border-radius:7px;background:transparent;color:var(--dim);cursor:pointer;
   transition:background .18s var(--ease),color .18s var(--ease);}
@@ -2014,11 +2022,11 @@ svg{flex:none;}
 ::-webkit-scrollbar-track{background:transparent;}
 @media (max-width:900px){
   :root{--side:60px;}
-  .ltname,.lcnt,.brandrow h1,.brandrow .ver,.navlbl,.addlib span,.sfbtn b,.statline{display:none;}
+  .ltname,.lcnt,.brandrow h1,.brandrow .ver,.navlbl,.addlib span{display:none;}
+  .fpath{max-width:190px;} #depswarn span:not(.spin){display:none;}
   .side{align-items:center;padding:15px 8px 11px;}
   .brandrow{padding:2px 0 15px;}
   .lt,.addlib{justify-content:center;padding:0;}
-  .sfbtn{justify-content:center;}
   .libttl h2{font-size:19px;}
   #q{width:120px;}
 }
@@ -2045,22 +2053,6 @@ svg{flex:none;}
     <span>Add library</span>
   </button>
   <span class="sp"></span>
-  <div class="sidefoot">
-    <div class="statline">
-      <span id="deps" class="stat"><span class="dot"></span>deps</span>
-      <span id="auth" class="stat"><span class="dot"></span>login</span>
-    </div>
-    <button class="sfbtn" onclick="pickDir()" title="Change download folder">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>
-      <b id="dir"></b>
-    </button>
-    <button class="sfbtn" onclick="toggleConsole()" aria-label="Toggle console">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
-      <span id="counts" class="chip"><span class="dot"></span>ok 0 &middot; failed 0</span>
-    </button>
-  </div>
 </aside>
 
 <main class="main">
@@ -2075,16 +2067,25 @@ svg{flex:none;}
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
         stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
       <span id="dlLabel">Download</span></button>
+    <span id="depswarn" class="warnpill" role="status">
+      <span class="spin"></span><span id="depstxt">Setting up…</span>
+    </span>
     <button id="upd" class="upd" onclick="updateClick()"></button>
     <button class="ib" id="importbtn" title="Add local video files" aria-label="Import local videos"
             onclick="pywebview.api.pick_files()">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
     </button>
+    <button class="ib" id="conbtn" onclick="toggleConsole()" title="Activity log" aria-label="Activity log">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
+      <span class="ibadge" id="conbadge"></span>
+    </button>
     <button class="ib" id="loginbtn" title="Log into the pasted URL's site (YouTube if empty)"
             aria-label="Log in" onclick="pywebview.api.login(document.getElementById('url').value)">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/></svg>
+      <span class="idot" id="authdot"></span>
     </button>
   </header>
 
@@ -2134,8 +2135,9 @@ svg{flex:none;}
   <div class="chead">
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
       stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
-    Console<span class="sp"></span>
-    <button class="cx" onclick="toggleConsole()" aria-label="Hide console">
+    Activity<span class="sp"></span>
+    <span id="counts" class="chip"><span class="dot"></span>ok 0 &middot; failed 0</span>
+    <button class="cx" onclick="toggleConsole()" aria-label="Hide activity log">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
     </button>
@@ -2230,7 +2232,8 @@ var P={
  plus:'<path d="M12 5v14"/><path d="M5 12h14"/>',
  up:'<path d="M12 20V5"/><path d="m6 11 6-6 6 6"/>',
  down:'<path d="M12 4v15"/><path d="m6 13 6 6 6-6"/>',
- film:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 12h18"/>'
+ film:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 12h18"/>',
+ edit:'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'
 };
 function ic(n,sz,cls){return '<svg class="'+(cls||'')+'" width="'+(sz||16)+'" height="'+(sz||16)+
   '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';}
@@ -2245,11 +2248,10 @@ function lineClass(t){
   return"";
 }
 function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
-function setStat(el,label,cls){el.className="stat "+cls;el.innerHTML='<span class="dot"></span>'+label;}
 function toggleConsole(){document.getElementById("console").classList.toggle("open");}
 
 /* ================= libraries ================= */
-var activeTab="downloads",allTabs=[{id:"downloads",name:"Downloads",builtin:true}];
+var activeTab="downloads",dlFolder="",allTabs=[{id:"downloads",name:"Downloads",builtin:true}];
 function tabOf(c){return c.tab||"downloads";}
 function tabById(id){
   for(var i=0;i<allTabs.length;i++)if(allTabs[i].id===id)return allTabs[i];
@@ -2278,19 +2280,33 @@ function switchTab(id){
   document.getElementById("libtitle").textContent=t.name;
   document.getElementById("libicon").innerHTML=ic(t.builtin?"down":"film",16);
   document.getElementById("filtertabs").style.display=t.builtin?"flex":"none";
-  var sub=document.getElementById("libsub");sub.innerHTML="";
-  if(!t.builtin){
-    var p=document.createElement("span");p.className="fpath";p.textContent=t.folder||"";
-    sub.appendChild(p);
-    sub.appendChild(hbtn("retry","Re-scan this folder for new videos",function(){
-      pywebview.api.scan_tab(t.id);},""));
-    if(!t.fixed)sub.appendChild(hbtn("trash","Remove this library (files are kept)",
-      removeTab,"danger"));
-  }
+  renderSub();
   renderTabs(allTabs.slice(1));
   loadView(id);
   refreshView();
   checkFiles();
+}
+/* every library shows its own folder next to its heading */
+function renderSub(){
+  var t=tabById(activeTab),sub=document.getElementById("libsub");
+  if(!sub)return;
+  sub.innerHTML="";
+  var path=t.builtin?dlFolder:(t.folder||"");
+  var p=document.createElement("span");
+  p.className="fpath";p.title=path;
+  p.innerHTML=ic("folder",12)+"<span>"+esc(path)+"</span>";
+  sub.appendChild(p);
+  if(t.builtin){
+    sub.appendChild(hbtn("edit","Change download folder",pickDir));
+  }else{
+    sub.appendChild(hbtn("retry","Re-scan this folder for new videos",function(){
+      pywebview.api.scan_tab(t.id);}));
+    if(!t.fixed)sub.appendChild(hbtn("trash","Remove this library (files are kept)",
+      removeTab,"danger"));
+  }
+  var d=document.createElement("span");d.className="subdot";d.textContent="·";
+  var c=document.createElement("span");c.className="subcount";c.id="subcount";
+  sub.appendChild(d);sub.appendChild(c);
 }
 function hbtn(icon,title,fn,cls){
   var b=document.createElement("button");
@@ -2371,10 +2387,8 @@ function refreshView(){
   var lc=document.querySelectorAll("#tabbar .lt .lcnt");
   for(var j=0;j<lc.length&&j<allTabs.length;j++)lc[j].textContent=per[allTabs[j].id]||0;
   var t2=tabById(activeTab);
-  if(t2.builtin){
-    var s=document.getElementById("libsub");
-    if(!s.querySelector(".fpath"))s.textContent=shown+(shown===1?" video":" videos");
-  }
+  var sc=document.getElementById("subcount");
+  if(sc)sc.textContent=shown+(shown===1?" video":" videos");
   var e=document.getElementById("empty");
   if(e){
     e.style.display=shown===0?"flex":"none";
@@ -2382,7 +2396,7 @@ function refreshView(){
     document.getElementById("empty-ic").innerHTML=ic(t2.builtin?"down":"film",26);
     if(curQuery){t.textContent="No matches";ss.textContent='Nothing here matches "'+curQuery+'"';}
     else if(!t2.builtin){t.textContent="Nothing in "+t2.name+" yet";
-      ss.textContent="Drop video files here, or click the folder path above to scan it";}
+      ss.textContent="Drop video files here, or use the re-scan button next to the folder above";}
     else if(curFilter==="active"){t.textContent="Nothing downloading";ss.textContent="Queued and in-progress downloads show up here";}
     else if(curFilter==="failed"){t.textContent="No failed downloads";ss.textContent="Failures stay here until you retry or remove them";}
     else{t.textContent="No downloads yet";ss.textContent="Paste a link above and your videos appear here";}
@@ -2508,9 +2522,15 @@ var ui={
     logEl.scrollTop=logEl.scrollHeight;
   },
   setState:function(s){
-    document.getElementById("dir").textContent=s.dir;
-    setStat(document.getElementById("auth"),s.logged_in?"signed in":"login",s.logged_in?"ok":"warn");
-    setStat(document.getElementById("deps"),s.deps_ok?"ready":"deps",s.deps_ok?"ok":"warn");
+    if(s.dir){dlFolder=s.dir;renderSub();}
+    var ad=document.getElementById("authdot");
+    ad.className="idot"+(s.logged_in?" ok":"");
+    document.getElementById("loginbtn").title=s.logged_in
+      ? "Signed in — click to sign into another site"
+      : "Not signed in — click to log in (YouTube if the box is empty)";
+    // deps only take up space while they actually need attention
+    var dw=document.getElementById("depswarn");
+    dw.classList.toggle("on",!s.deps_ok);
     document.getElementById("dl").disabled=!s.deps_ok;
     document.getElementById("s-go").disabled=!s.deps_ok;
     isBusy=!!s.busy;
@@ -2521,6 +2541,9 @@ var ui={
     var el=document.getElementById("counts");
     el.className="chip "+(failCount?"warn":(okCount?"ok":""));
     el.innerHTML='<span class="dot"></span>ok '+okCount+' · failed '+failCount;
+    var bd=document.getElementById("conbadge");   // failures surface on the log button
+    bd.textContent=failCount||"";
+    bd.classList.toggle("on",failCount>0);
     sortGrid(curSort);
   },
   updateAvail:function(v){
@@ -2674,7 +2697,7 @@ function confirmDl(){
       (lastInfo&&lastInfo.ok?{title:lastInfo.title,thumb:lastInfo.thumb}:{}))
     .then(function(r){if(r==="no-deps")ui.log("[!] dependencies missing");});
 }
-function pickDir(){pywebview.api.pick_folder().then(function(d){document.getElementById("dir").textContent=d;});}
+function pickDir(){pywebview.api.pick_folder().then(function(d){dlFolder=d;renderSub();});}
 document.addEventListener("keydown",function(e){
   var open=document.getElementById("dlg").classList.contains("open");
   if(e.key==="Escape"){if(open){closeDlg();}else{document.getElementById("console").classList.remove("open");}return;}
