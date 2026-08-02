@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.11.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.12.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -50,6 +50,9 @@ CONFIG_FILE = APP_DIR / "config.json"
 HISTORY_FILE = APP_DIR / "history.json"
 FAILED_FILE = APP_DIR / "failed.json"   # failed/unfinished downloads, retryable after restart
 THUMB_DIR = APP_DIR / "thumbs"          # generated posters for imported local videos
+SITES_FILE = APP_DIR / "supported_sites.json"   # cached copy of yt-dlp's list
+SITES_URL = "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/supportedsites.md"
+SITES_MAX_AGE = 7 * 24 * 3600           # refetch weekly; yt-dlp adds sites often
 LOG_FILE = APP_DIR / "ytgrab.log"
 YTDLP = BIN_DIR / "yt-dlp.exe"
 FFMPEG = BIN_DIR / "ffmpeg.exe"
@@ -206,6 +209,63 @@ DOWNLOADS_TAB = "downloads"   # built-in library tab; the rest are folder-backed
 DOWNLOADS_NAME = "YT Downloads"
 # 'fixed' tabs ship with the app and cannot be removed
 DEFAULT_TABS = [{"id": "imported", "name": "Imported", "folder": "", "fixed": True}]
+
+
+def short_path(p):
+    """C:\\Users\\me\\AppData\\Local\\YTGrab\\bin -> %LOCALAPPDATA%\\YTGrab\\bin"""
+    s = str(p)
+    for var in ("LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+        base = os.environ.get(var)
+        if base and s.lower().startswith(base.lower()):
+            return f"%{var}%" + s[len(base):]
+    return s
+
+
+RE_SUPPORTED = re.compile(r"^\s*-\s*\*\*(.+?)\*\*\s*(?::\s*(.*))?$")
+
+
+def parse_supported(md):
+    """yt-dlp's supportedsites.md -> [{'name','note','broken'}] (live, not baked in)."""
+    out = []
+    for line in (md or "").splitlines():
+        m = RE_SUPPORTED.match(line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        rest = (m.group(2) or "").strip()
+        broken = "currently broken" in rest.lower()
+        note = re.sub(r"\(\*\*.*?\*\*\)", "", rest)          # drop the broken marker
+        note = re.sub(r"\[\*(.*?)\*\]\(##[^)]*\)", r"\1", note)   # netrc machine links
+        note = re.sub(r"\s{2,}", " ", note).strip(" :")
+        out.append({"name": name, "note": note, "broken": broken})
+    return out
+
+
+def load_sites_cache():
+    d = _load_json(SITES_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def fetch_supported(force=False):
+    """Cached weekly; falls back to whatever was cached if the network is down."""
+    cache = load_sites_cache()
+    fresh = cache.get("sites") and (time.time() - cache.get("ts", 0)) < SITES_MAX_AGE
+    if fresh and not force:
+        return cache
+    try:
+        with http_get(SITES_URL, timeout=25) as r:
+            md = r.read().decode("utf-8", "replace")
+        sites = parse_supported(md)
+        if not sites:
+            raise ValueError("nothing parsed")
+        cache = {"ts": time.time(), "sites": sites}
+        try:
+            SITES_FILE.write_text(json.dumps(cache), encoding="utf-8")
+        except OSError:
+            pass
+        return cache
+    except Exception:
+        return cache or {"ts": 0, "sites": []}
 
 
 def site_name(host):
@@ -1382,7 +1442,13 @@ class Api:
                     "where": str(p) if p.exists() else "not installed"}
         deps = [dep(YTDLP, "yt-dlp"), dep(FFMPEG, "ffmpeg"),
                 dep(FFPROBE, "ffprobe"), dep(NODE, "node (YouTube JS challenge)")]
-        return {"sites": sites, "deps": deps, "bin": str(BIN_DIR)}
+        return {"sites": sites, "deps": deps, "bin": short_path(BIN_DIR)}
+
+    def get_supported(self, refresh=False):
+        """yt-dlp's own supported-site list, fetched live and cached."""
+        c = fetch_supported(bool(refresh))
+        return {"sites": c.get("sites", []), "ts": c.get("ts", 0),
+                "count": len(c.get("sites", []))}
 
     def add_site(self, url):
         """Remember a site and open its login window."""
@@ -2136,12 +2202,35 @@ svg{flex:none;}
 #profscrim{position:fixed;inset:0;background:rgba(4,4,9,.74);opacity:0;pointer-events:none;
   transition:opacity .2s var(--ease);z-index:21;backdrop-filter:blur(3px);}
 #profscrim.open{opacity:1;pointer-events:auto;}
-#prof{position:fixed;right:14px;top:14px;bottom:14px;width:min(400px,94vw);opacity:0;
-  pointer-events:none;transform:translateX(14px);overflow-y:auto;background:var(--s2);
-  border:1px solid var(--line2);border-radius:var(--r-xl);padding:20px;z-index:22;
-  display:flex;flex-direction:column;gap:20px;
-  transition:opacity .2s var(--ease),transform .2s var(--ease);box-shadow:-24px 0 64px rgba(0,0,0,.6);}
-#prof.open{opacity:1;pointer-events:auto;transform:none;}
+#prof{position:fixed;left:50%;top:50%;transform:translate(-50%,-48%) scale(.98);opacity:0;
+  pointer-events:none;width:min(540px,94vw);max-height:86vh;overflow:hidden;background:var(--s2);
+  border:1px solid var(--line2);border-radius:var(--r-xl);padding:22px;z-index:22;
+  display:flex;flex-direction:column;gap:18px;
+  transition:opacity .2s var(--ease),transform .2s var(--ease);box-shadow:0 30px 76px rgba(0,0,0,.66);}
+#prof.open{opacity:1;pointer-events:auto;transform:translate(-50%,-50%) scale(1);}
+.ppane{display:flex;flex-direction:column;gap:18px;overflow-y:auto;min-height:0;}
+#sitespane{display:none;}
+#prof.sites #mainpane{display:none;}
+#prof.sites #sitespane{display:flex;}
+.sitehead{display:flex;align-items:center;gap:9px;}
+.backb{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border:none;
+  border-radius:99px;background:var(--s1);color:var(--mut);cursor:pointer;font:600 12px/1 inherit;
+  transition:background .18s var(--ease),color .18s var(--ease);}
+.backb:hover{background:var(--s3);color:var(--tx);}
+#ssearch{flex:1;min-width:0;height:34px;border:1px solid var(--line2);border-radius:99px;
+  background:var(--s1);color:var(--tx);padding:0 14px;font:12.5px/1 inherit;}
+#ssearch:focus{outline:none;border-color:var(--ac);}
+#ssearch::placeholder{color:var(--dim);}
+#sslist{display:flex;flex-direction:column;gap:3px;overflow-y:auto;min-height:0;flex:1;}
+.ssrow{display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:var(--r-sm);
+  background:var(--s1);border:1px solid transparent;}
+.ssrow:hover{border-color:var(--line);}
+.ssnm{font:600 12.5px/1.3 inherit;color:var(--tx);white-space:nowrap;}
+.ssnote{flex:1;min-width:0;font-size:11px;color:var(--dim);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;}
+.ssbroken{font-size:10px;font-weight:700;color:var(--warn);background:rgba(247,185,85,.13);
+  padding:2px 7px;border-radius:99px;white-space:nowrap;}
+.ssfoot{display:flex;align-items:center;gap:8px;}
 .phead{display:flex;align-items:center;gap:8px;}
 .phead h3{margin:0;font-size:17px;font-weight:680;letter-spacing:-.3px;}
 .sitelist{display:flex;flex-direction:column;gap:6px;}
@@ -2153,6 +2242,10 @@ svg{flex:none;}
 .srow .snm{flex:1;min-width:0;font:600 13px/1.3 inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .srow .sst{font-size:11px;color:var(--mut);white-space:nowrap;}
 .srow .sact{display:flex;gap:4px;}
+.openb{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 10px;border:none;
+  border-radius:99px;background:var(--s3);color:var(--mut);cursor:pointer;font:600 11px/1 inherit;
+  transition:background .18s var(--ease),color .18s var(--ease);}
+.openb:hover{background:var(--ac-soft);color:#FF9CC4;}
 .sbtn2{width:26px;height:26px;border:none;border-radius:7px;background:transparent;color:var(--dim);
   display:flex;align-items:center;justify-content:center;cursor:pointer;
   transition:background .18s var(--ease),color .18s var(--ease);}
@@ -2384,21 +2477,43 @@ svg{flex:none;}
         stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
     </button>
   </div>
-  <div class="field">
-    <span class="slabel">SIGNED-IN SITES</span>
-    <div id="sitelist" class="sitelist"></div>
-    <div class="addsite">
-      <input type="text" id="newsite" placeholder="Add a site, e.g. hotstar.com" spellcheck="false"
-             aria-label="Website to sign into">
-      <button class="tbtn solid" onclick="addSite()">Sign in</button>
+  <div class="ppane" id="mainpane">
+    <div class="field">
+      <span class="slabel">SIGNED-IN SITES</span>
+      <div id="sitelist" class="sitelist"></div>
+      <div class="addsite">
+        <input type="text" id="newsite" placeholder="Add a site, e.g. hotstar.com" spellcheck="false"
+               aria-label="Website to sign into">
+        <button class="tbtn solid" onclick="addSite()">Sign in</button>
+      </div>
+      <div class="depfoot">
+        <span class="msub">Not sure if a site works?</span><span class="sp"></span>
+        <button class="tbtn" onclick="openSites()">Supported websites</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="slabel">DEPENDENCIES</span>
+      <div id="deplist" class="sitelist"></div>
+      <div class="depfoot">
+        <span id="depbin" class="msub"></span><span class="sp"></span>
+        <button class="tbtn" onclick="pywebview.api.update_deps();setTimeout(loadProfile,1200)">Check for updates</button>
+      </div>
     </div>
   </div>
-  <div class="field">
-    <span class="slabel">DEPENDENCIES</span>
-    <div id="deplist" class="sitelist"></div>
-    <div class="depfoot">
-      <span id="depbin" class="msub"></span><span class="sp"></span>
-      <button class="tbtn" onclick="pywebview.api.update_deps();setTimeout(loadProfile,1200)">Check for updates</button>
+
+  <div class="ppane" id="sitespane">
+    <div class="sitehead">
+      <button class="backb" onclick="closeSites()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+          stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Back
+      </button>
+      <input type="text" id="ssearch" placeholder="Search supported websites" spellcheck="false"
+             aria-label="Search supported websites" oninput="renderSites()">
+    </div>
+    <div id="sslist"></div>
+    <div class="ssfoot">
+      <span id="ssmeta" class="msub"></span><span class="sp"></span>
+      <button class="tbtn" onclick="loadSites(true)">Refresh list</button>
     </div>
   </div>
 </div>
@@ -2484,7 +2599,8 @@ var P={
  film:'<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 12h18"/>',
  edit:'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
  login:'<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="m10 17 5-5-5-5"/><path d="M15 12H3"/>',
- user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/>'
+ user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-3.5 3.6-6 8-6s8 2.5 8 6"/>',
+ external:'<path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/>'
 };
 function ic(n,sz,cls){return '<svg class="'+(cls||'')+'" width="'+(sz||16)+'" height="'+(sz||16)+
   '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';}
@@ -3061,7 +3177,7 @@ function openProf(){
 }
 function closeProf(){
   document.getElementById("profscrim").classList.remove("open");
-  document.getElementById("prof").classList.remove("open");
+  document.getElementById("prof").classList.remove("open","sites");
 }
 function loadProfile(){
   pywebview.api.get_profile().then(function(p){
@@ -3074,8 +3190,10 @@ function loadProfile(){
                   '</span><span class="sst">'+st+"</span>";
       var acts=document.createElement("span");acts.className="sact";
       var lg=document.createElement("button");
-      lg.className="sbtn2";lg.title="Sign in again";lg.setAttribute("aria-label","Sign into "+s.name);
-      lg.innerHTML=ic("login",14);
+      lg.className="openb";
+      lg.title="Opens "+s.name+" in a window so you can sign in";
+      lg.setAttribute("aria-label","Open "+s.name+" to sign in");
+      lg.innerHTML=ic("external",12)+"<span>Open</span>";
       lg.onclick=function(){pywebview.api.login("https://"+s.host+"/");closeProf();};
       acts.appendChild(lg);
       if(!s.builtin){
@@ -3101,6 +3219,56 @@ function loadProfile(){
   });
 }
 function showProfile(p){loadProfile();}
+
+/* ---- supported websites: pulled live from yt-dlp, cached by the backend ---- */
+var suppSites=null;
+function openSites(){
+  document.getElementById("prof").classList.add("sites");
+  if(!suppSites)loadSites(false);
+  else renderSites();
+  setTimeout(function(){var s=document.getElementById("ssearch");if(s)s.focus();},60);
+}
+function closeSites(){document.getElementById("prof").classList.remove("sites");}
+function loadSites(refresh){
+  var box=document.getElementById("sslist");
+  box.innerHTML='<div class="qload">Loading the list from yt-dlp…</div>';
+  document.getElementById("ssmeta").textContent="";
+  pywebview.api.get_supported(!!refresh).then(function(d){
+    suppSites=d.sites||[];
+    var when=d.ts?new Date(d.ts*1000).toLocaleDateString():"never";
+    document.getElementById("ssmeta").textContent=
+      suppSites.length?(d.count+" sites · updated "+when):"Couldn't reach the list — check your connection";
+    renderSites();
+  })["catch"](function(){
+    box.innerHTML='<div class="qload">Couldn\'t load the list.</div>';
+  });
+}
+function renderSites(){
+  var box=document.getElementById("sslist");if(!box)return;
+  if(!suppSites){box.innerHTML="";return;}
+  var q=(document.getElementById("ssearch").value||"").trim().toLowerCase();
+  var list=q?suppSites.filter(function(s){
+      return s.name.toLowerCase().indexOf(q)!==-1||
+             (s.note||"").toLowerCase().indexOf(q)!==-1;}):suppSites;
+  var shown=list.slice(0,400);            // list is ~1700 long; keep the DOM sane
+  box.innerHTML="";
+  if(!shown.length){
+    box.innerHTML='<div class="qload">No site matches "'+esc(q)+'"</div>';
+    return;
+  }
+  shown.forEach(function(s){
+    var r=document.createElement("div");r.className="ssrow";
+    r.innerHTML='<span class="ssnm">'+esc(s.name)+'</span>'+
+                '<span class="ssnote">'+esc(s.note||"")+'</span>'+
+                (s.broken?'<span class="ssbroken">may be broken</span>':"");
+    box.appendChild(r);
+  });
+  if(list.length>shown.length){
+    var more=document.createElement("div");more.className="qload";
+    more.textContent="+"+(list.length-shown.length)+" more — keep typing to narrow it down";
+    box.appendChild(more);
+  }
+}
 function addSite(){
   var i=document.getElementById("newsite"),v=i.value.trim();
   if(!v)return;
@@ -3109,7 +3277,13 @@ function addSite(){
 }
 document.addEventListener("keydown",function(e){
   var open=document.getElementById("dlg").classList.contains("open");
-  if(e.key==="Escape"){if(open){closeDlg();}else{document.getElementById("console").classList.remove("open");}return;}
+  var prof=document.getElementById("prof");
+  if(e.key==="Escape"){
+    if(prof.classList.contains("sites")){closeSites();return;}
+    if(prof.classList.contains("open")){closeProf();return;}
+    if(open){closeDlg();}else{document.getElementById("console").classList.remove("open");}
+    return;
+  }
   if((e.ctrlKey||e.metaKey)&&e.key==="f"){e.preventDefault();document.getElementById("q").focus();return;}
   if(e.key==="Enter"){if(open){confirmDl();}
     else if(document.activeElement===document.getElementById("url")){startDl();}}
