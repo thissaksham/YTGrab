@@ -14,11 +14,13 @@ All app data lives in %LOCALAPPDATA%\\YTGrab\\ (bin, profile, config, history).
 
 Build: pyinstaller --onefile --windowed --name YTGrab --icon ytgrab.ico ytgrab.py
 """
+import base64
 import ctypes
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.6.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.7.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -47,6 +49,7 @@ PROFILE_DIR = APP_DIR / "profile"
 CONFIG_FILE = APP_DIR / "config.json"
 HISTORY_FILE = APP_DIR / "history.json"
 FAILED_FILE = APP_DIR / "failed.json"   # failed/unfinished downloads, retryable after restart
+THUMB_DIR = APP_DIR / "thumbs"          # generated posters for imported local videos
 LOG_FILE = APP_DIR / "ytgrab.log"
 YTDLP = BIN_DIR / "yt-dlp.exe"
 FFMPEG = BIN_DIR / "ffmpeg.exe"
@@ -146,6 +149,69 @@ def fmt_dur(sec):
     h, r = divmod(sec, 3600)
     m, s = divmod(r, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# === local file import (drag & drop) ===
+
+def ffprobe_meta(path):
+    """Duration/resolution/codecs of a local file. {} if ffprobe is missing."""
+    if not FFPROBE.exists():
+        return {}
+    try:
+        r = subprocess.run([str(FFPROBE), "-v", "quiet", "-print_format", "json",
+                            "-show_format", "-show_streams", str(path)],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", creationflags=NO_WINDOW, timeout=60)
+        d = json.loads(r.stdout or "{}")
+    except Exception:
+        return {}
+    streams = d.get("streams", [])
+    v = next((s for s in streams if s.get("codec_type") == "video"), {})
+    dur = (d.get("format") or {}).get("duration")
+    try:
+        dur = float(dur) if dur else 0.0
+    except (TypeError, ValueError):
+        dur = 0.0
+    return {"duration": dur, "height": v.get("height"), "vcodec": v.get("codec_name")}
+
+
+def make_thumb(src, dest, at):
+    """Grab one frame as a small jpg poster. False if it couldn't be made."""
+    if not FFMPEG.exists():
+        return False
+    try:
+        subprocess.run([str(FFMPEG), "-v", "quiet", "-y", "-ss", str(at), "-i", str(src),
+                        "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "6", str(dest)],
+                       capture_output=True, creationflags=NO_WINDOW, timeout=90)
+    except Exception:
+        return False
+    return dest.exists() and dest.stat().st_size > 0
+
+
+def entry_thumb(e):
+    """History thumb for the UI. Local posters are inlined as a data URI --
+    the UI is loaded from a string, so it cannot fetch file:// images."""
+    if e.get("thumb"):
+        return e["thumb"]
+    tf = e.get("thumb_file")
+    if not tf:
+        return ""
+    try:
+        return "data:image/jpeg;base64," + base64.b64encode(Path(tf).read_bytes()).decode()
+    except OSError:
+        return ""
+
+
+def unique_path(p):
+    """A free path next to p: 'clip.mp4' -> 'clip (2).mp4'."""
+    if not p.exists():
+        return p
+    i = 2
+    while True:
+        q = p.with_name(f"{p.stem} ({i}){p.suffix}")
+        if not q.exists():
+            return q
+        i += 1
 
 
 # === captive-profile helpers (no cookie ever persists to disk) ===
@@ -820,10 +886,87 @@ class Api:
             save_config(self.cfg)
         return self.download_dir()
 
+    def pick_files(self):
+        """Keyboard/menu route to the same thing drag & drop does."""
+        fd = getattr(webview, "FileDialog", None)   # OPEN_DIALOG is deprecated in 6.x
+        res = UI_WIN.create_file_dialog(
+            fd.OPEN if fd else webview.OPEN_DIALOG,
+            allow_multiple=True, directory=self.download_dir(),
+            file_types=("Video files (*.mp4;*.mkv;*.webm;*.mov;*.avi;*.m4v;*.flv)",
+                        "All files (*.*)"))
+        if res:
+            self.import_paths(list(res))
+        return "ok"
+
+    # --- local import ---
+
+    def import_paths(self, paths):
+        """Add local videos to the library: move each into the download folder
+        (unless it already lives there) and record it in history."""
+        vids, skipped = [], 0
+        for p in paths or []:
+            q = Path(p)
+            if q.is_file() and q.suffix.lower() in VIDEO_EXTS:
+                vids.append(q)
+            else:
+                skipped += 1
+        if skipped:
+            self._push(f"[import] ignored {skipped} non-video item(s)")
+        if not vids:
+            return "none"
+        threading.Thread(target=self._import_worker, args=(vids,), daemon=True).start()
+        return "started"
+
+    def _import_worker(self, vids):
+        dl_dir = Path(self.download_dir())
+        THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        ok = 0
+        for src in vids:
+            key = "local-" + os.urandom(5).hex()
+            try:
+                self._item(key=key, status="processing", phase="Importing",
+                           title=src.stem)
+                ok += 1 if self._import_one(src, dl_dir, key) else 0
+            except Exception as e:
+                self._push(f"[!] import failed for {src.name}: {e}")
+                self._item(key=key, status="failed", title=src.stem)
+        self._push(f"[+] imported {ok} of {len(vids)} file(s)")
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js("sortGrid(curSort)")
+            except Exception:
+                pass
+
+    def _import_one(self, src, dl_dir, key):
+        already = src.parent.resolve() == dl_dir.resolve()
+        target = src if already else unique_path(dl_dir / src.name)
+        if not already:
+            self._item(key=key, status="processing", phase="Moving")
+            shutil.move(str(src), str(target))
+            self._push(f"[import] moved {src.name} -> {dl_dir}")
+        self._item(key=key, status="processing", phase="Reading video")
+        meta = ffprobe_meta(target)
+        tf = THUMB_DIR / f"{key}.jpg"
+        seek = min(3, int(meta.get("duration") or 0) // 10) if meta.get("duration") else 0
+        if not (make_thumb(target, tf, seek) or make_thumb(target, tf, 0)):
+            tf = None
+        st = target.stat()
+        h = meta.get("height")
+        self._add_history({
+            "id": key, "title": target.stem, "channel": "", "source": "local",
+            "duration": fmt_dur(meta["duration"]) if meta.get("duration") else "",
+            "format": (f"{h}p " if h else "") + target.suffix.lstrip(".").lower(),
+            "size": st.st_size, "size_h": human_size(st.st_size),
+            "thumb": "", "thumb_file": str(tf) if tf else "",
+            "path": str(target), "ts": time.time(), "released": st.st_mtime,
+        })
+        return True
+
     # --- history ---
 
     def get_history(self):
-        return [{**e, "exists": Path(e.get("path", "")).exists()} for e in self.history]
+        return [{**e, "thumb": entry_thumb(e), "exists": Path(e.get("path", "")).exists()}
+                for e in self.history]
 
     def get_pending(self):
         """Failed/unfinished downloads from a previous run, so they can be retried."""
@@ -838,8 +981,8 @@ class Api:
         save_history(self.history)
         self._item(key=e["id"], status="done", title=e["title"], channel=e["channel"],
                    duration=e["duration"], size=e["size_h"], format=e["format"],
-                   thumb=e["thumb"], path=e["path"], ts=e.get("ts"),
-                   released=e.get("released"))
+                   thumb=entry_thumb(e), path=e["path"], ts=e.get("ts"),
+                   released=e.get("released"), source=e.get("source"))
 
     def play(self, key):
         for e in self.history:
@@ -882,6 +1025,8 @@ class Api:
                 else:
                     self._push(f"[!] could not delete file: {Path(p).name}")
                     result = "error"
+        if entry and entry.get("thumb_file"):
+            Path(entry["thumb_file"]).unlink(missing_ok=True)
         self.history = [e for e in self.history if e.get("id") != key]
         save_history(self.history)
         self._clear_failed(key)   # also dismiss it from the retry-after-restart list
@@ -1601,6 +1746,15 @@ svg{flex:none;}
 .chip.ok .dot{background:var(--ok);} .chip.warn .dot{background:var(--warn);}
 
 /* ---------- modal ---------- */
+/* ---------- drop zone ---------- */
+#drop{position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;
+  background:rgba(3,7,15,.82);backdrop-filter:blur(4px);}
+#drop.on{display:flex;}
+.dropcard{display:flex;flex-direction:column;align-items:center;gap:var(--sp-3);
+  padding:38px 52px;border:2px dashed var(--ac);border-radius:var(--r-xl);
+  background:var(--ac-soft);color:var(--ac-dim);text-align:center;}
+.dropcard b{font-size:16px;font-weight:650;color:var(--tx);}
+.dropcard span{font-size:12.5px;color:var(--mut);max-width:320px;}
 #scrim{position:fixed;inset:0;background:rgba(3,7,15,.72);opacity:0;pointer-events:none;
   transition:opacity .2s var(--ease);z-index:9;backdrop-filter:blur(3px);}
 #scrim.open{opacity:1;pointer-events:auto;}
@@ -1691,6 +1845,11 @@ svg{flex:none;}
   </div>
   <span class="sp"></span>
   <button id="upd" class="upd" onclick="updateClick()"></button>
+  <button class="ib" id="importbtn" title="Add local video files to your library"
+          aria-label="Import local videos" onclick="pywebview.api.pick_files()">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+      stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+  </button>
   <button class="ib" id="loginbtn" title="Log into the pasted URL's site (YouTube if empty)"
           aria-label="Log in" onclick="pywebview.api.login(document.getElementById('url').value)">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -1716,6 +1875,7 @@ svg{flex:none;}
     <button class="tab on" role="tab" aria-selected="true" data-f="all" onclick="pickFilter('all')">All <span class="cnt" id="c-all">0</span></button>
     <button class="tab" role="tab" aria-selected="false" data-f="active" onclick="pickFilter('active')">Active <span class="cnt" id="c-active">0</span></button>
     <button class="tab" role="tab" aria-selected="false" data-f="done" onclick="pickFilter('done')">Done <span class="cnt" id="c-done">0</span></button>
+    <button class="tab" role="tab" aria-selected="false" data-f="imported" onclick="pickFilter('imported')">Imported <span class="cnt" id="c-imported">0</span></button>
     <button class="tab" role="tab" aria-selected="false" data-f="failed" onclick="pickFilter('failed')">Failed <span class="cnt" id="c-failed">0</span></button>
   </div>
   <span class="sp"></span>
@@ -1769,6 +1929,15 @@ svg{flex:none;}
     <span id="counts" class="chip"><span class="dot"></span>ok 0 &middot; failed 0</span>
   </button>
 </footer>
+</div>
+
+<div id="drop">
+  <div class="dropcard">
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+      stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+    <b>Drop videos to add them</b>
+    <span>They move to your download folder and join your library under Imported</span>
+  </div>
 </div>
 
 <div id="scrim" onclick="closeDlg()"></div>
@@ -1867,12 +2036,12 @@ function toggleConsole(){document.getElementById("console").classList.toggle("op
 /* ---- library filtering ---- */
 var curFilter="all",curQuery="";
 function bucket(c){
-  if(c.status==="done")return "done";
   if(c.status==="failed")return "failed";
-  return ACTIVE[c.status]?"active":"done";
+  if(ACTIVE[c.status])return "active";
+  return c.source==="local"?"imported":"done";
 }
 function refreshView(){
-  var n={all:0,active:0,done:0,failed:0},shown=0;
+  var n={all:0,active:0,done:0,imported:0,failed:0},shown=0;
   var nodes=gridEl.querySelectorAll(".gc");
   for(var i=0;i<nodes.length;i++){
     var el=nodes[i],c=cards[el.id.slice(2)]||{},b=bucket(c);
@@ -1882,7 +2051,7 @@ function refreshView(){
     el.classList.toggle("hide",!hit);
     if(hit)shown++;
   }
-  ["all","active","done","failed"].forEach(function(k){
+  ["all","active","done","imported","failed"].forEach(function(k){
     var e=document.getElementById("c-"+k);if(e)e.textContent=n[k];
   });
   var e=document.getElementById("empty");
@@ -1892,6 +2061,7 @@ function refreshView(){
     if(curQuery){t.textContent="No matches";s.textContent='Nothing here matches "'+curQuery+'"';}
     else if(curFilter==="active"){t.textContent="Nothing downloading";s.textContent="Queued and in-progress downloads show up here";}
     else if(curFilter==="failed"){t.textContent="No failed downloads";s.textContent="Failures stay here until you retry or remove them";}
+    else if(curFilter==="imported"){t.textContent="Nothing imported yet";s.textContent="Drag video files onto the window to add them to your library";}
     else if(curFilter==="done"&&n.all>0){t.textContent="Nothing finished yet";s.textContent="Completed downloads land here";}
     else{t.textContent="No downloads yet";s.textContent="Paste a link above and your videos appear here";}
   }
@@ -1906,6 +2076,33 @@ function pickFilter(f){
   refreshView();
 }
 function pickQuery(v){curQuery=(v||"").trim().toLowerCase();refreshView();}
+
+/* ---- drag & drop overlay (the actual import runs in Python, which is the
+       only side that receives real file paths from WebView2) ---- */
+var dragDepth=0;
+function hasFiles(e){
+  var t=e.dataTransfer&&e.dataTransfer.types;
+  if(!t)return false;
+  for(var i=0;i<t.length;i++)if(t[i]==="Files")return true;
+  return false;
+}
+function showDrop(on){
+  dragDepth=on?dragDepth:0;
+  var d=document.getElementById("drop");if(d)d.classList.toggle("on",!!on);
+}
+window.addEventListener("dragenter",function(e){
+  if(!hasFiles(e))return;
+  e.preventDefault();dragDepth++;showDrop(true);
+});
+window.addEventListener("dragover",function(e){if(hasFiles(e))e.preventDefault();});
+window.addEventListener("dragleave",function(e){
+  if(!hasFiles(e))return;
+  dragDepth--;if(dragDepth<=0)showDrop(false);
+});
+window.addEventListener("drop",function(e){
+  if(!hasFiles(e))return;
+  e.preventDefault();showDrop(false);
+});
 
 function subHtml(o){
   if(o.status==="done"){
@@ -2177,7 +2374,7 @@ window.addEventListener("pywebviewready",function(){
     list.slice().reverse().forEach(function(e){
       ui.item({key:e.id,status:"done",title:e.title,channel:e.channel,duration:e.duration,
                size:e.size_h,format:e.format,thumb:e.thumb,path:e.path,exists:e.exists,
-               ts:e.ts,released:e.released});
+               ts:e.ts,released:e.released,source:e.source});
     });
     pywebview.api.get_pending().then(function(pend){
       pend.forEach(function(p){
@@ -2192,6 +2389,22 @@ window.addEventListener("pywebviewready",function(){
 </script></body></html>"""
 
 
+def register_drop(api):
+    """Whole-window drop target. Only a pywebview-registered 'drop' listener
+    gets real paths (WebView2 hands them over as pywebviewFullPath); the plain
+    JS listener alongside it only drives the overlay and preventDefault."""
+    def on_drop(e):
+        files = ((e or {}).get("dataTransfer") or {}).get("files") or []
+        api.import_paths([f.get("pywebviewFullPath") for f in files
+                          if f.get("pywebviewFullPath")])
+    try:
+        from webview.dom import DOMEventHandler
+        UI_WIN.dom.get_element("body").events.drop += DOMEventHandler(
+            on_drop, prevent_default=True)
+    except Exception as e:
+        api._push(f"[!] drag-and-drop unavailable: {e}")
+
+
 def bootstrap(api):
     for _ in range(60):
         try:
@@ -2199,6 +2412,7 @@ def bootstrap(api):
             break
         except Exception:
             time.sleep(0.25)
+    register_drop(api)
     api._push(f"[*] {APP_NAME} started - data dir: {APP_DIR}")
     ensure_deps(api._push)
     api._set_state()
