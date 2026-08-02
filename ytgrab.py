@@ -38,7 +38,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.12.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.13.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -2067,13 +2067,6 @@ svg{flex:none;}
 .gtoggle.on{display:inline-flex;}
 .gtoggle:hover{color:var(--tx);}
 .gtoggle input{width:15px;height:15px;accent-color:var(--ac);cursor:pointer;flex:none;}
-.ghead{grid-column:1/-1;display:flex;align-items:center;gap:9px;padding:8px 2px 2px;
-  font:650 12.5px/1 inherit;color:var(--tx);}
-.ghead:first-child{padding-top:0;}
-.ghead svg{color:var(--ac);}
-.ghead .gcount{font-size:10.5px;font-weight:650;color:var(--dim);background:var(--s3);
-  padding:2px 7px;border-radius:99px;font-variant-numeric:tabular-nums;}
-.ghead .grule{flex:1;height:1px;background:var(--line);}
 .searchwrap{position:relative;display:flex;align-items:center;}
 .searchwrap svg{position:absolute;left:11px;color:var(--dim);pointer-events:none;}
 #q{width:168px;height:33px;border:1px solid var(--line2);border-radius:99px;background:var(--s1);
@@ -2091,18 +2084,27 @@ svg{flex:none;}
   transition:color .18s var(--ease),background .18s var(--ease);}
 #sortdir:hover{color:var(--tx);background:var(--s2);}
 
-/* ---------- sub-folders inside a library ---------- */
-#folders{display:none;flex-wrap:wrap;gap:9px;padding:0 22px 14px;flex:none;}
-#folders.on{display:flex;}
-.fold{display:inline-flex;align-items:center;gap:9px;height:42px;padding:0 14px 0 11px;
-  border:1px solid var(--line);border-radius:var(--r-md);background:var(--s1);color:var(--tx);
-  cursor:pointer;font:600 12.5px/1 inherit;max-width:250px;
-  transition:background .18s var(--ease),border-color .18s var(--ease),transform .18s var(--ease);}
-.fold:hover{background:var(--s3);border-color:var(--line2);transform:translateY(-1px);}
-.fold svg{color:var(--ac);}
-.fold .fnm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.fold .fct{font-size:10.5px;font-weight:650;color:var(--dim);background:var(--s4);
-  padding:2px 6px;border-radius:99px;font-variant-numeric:tabular-nums;}
+/* ---------- folder cards: same footprint as a video card ---------- */
+.fc{position:relative;border-radius:var(--r-lg);overflow:hidden;background:var(--s1);
+  border:1px solid var(--line);cursor:pointer;text-align:left;padding:0;color:inherit;
+  font:inherit;display:block;width:100%;
+  transition:transform .22s var(--ease),border-color .22s var(--ease),box-shadow .22s var(--ease);}
+.fc:hover{border-color:var(--line2);transform:translateY(-3px);box-shadow:0 14px 34px rgba(0,0,0,.55);}
+.fth{position:relative;aspect-ratio:16/9;background:var(--s3);overflow:hidden;
+  display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:2px;}
+.fth.one{grid-template-columns:1fr;grid-template-rows:1fr;}
+.fth img{width:100%;height:100%;object-fit:cover;transition:transform .35s var(--ease);}
+.fc:hover .fth img{transform:scale(1.05);}
+.fth .fempty{grid-column:1/-1;grid-row:1/-1;display:flex;align-items:center;justify-content:center;
+  color:#33333F;}
+.fth::after{content:"";position:absolute;inset:auto 0 0 0;height:46%;pointer-events:none;
+  background:linear-gradient(to top,rgba(4,4,8,.8),transparent);}
+.fbadge{position:absolute;z-index:2;bottom:8px;right:8px;display:inline-flex;align-items:center;
+  gap:5px;font-size:10.5px;font-weight:650;background:rgba(4,4,8,.72);color:#EAEAF2;
+  padding:3px 8px;border-radius:6px;backdrop-filter:blur(6px);font-variant-numeric:tabular-nums;}
+.fkind{position:absolute;z-index:2;top:8px;left:8px;width:26px;height:26px;border-radius:8px;
+  display:flex;align-items:center;justify-content:center;background:rgba(4,4,8,.66);
+  color:var(--ac);backdrop-filter:blur(6px);}
 .crumb{display:inline-flex;align-items:center;gap:4px;}
 .crumb button{border:none;background:transparent;color:var(--mut);cursor:pointer;
   font:12px/1 inherit;padding:3px 5px;border-radius:6px;}
@@ -2433,8 +2435,6 @@ svg{flex:none;}
     </div>
   </section>
 
-  <div id="folders"></div>
-
   <div id="grid">
     <div class="empty" id="empty">
       <span class="emptyic" id="empty-ic"></span>
@@ -2618,7 +2618,7 @@ function esc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").
 function toggleConsole(){document.getElementById("console").classList.toggle("open");}
 
 /* ================= libraries ================= */
-var activeTab="downloads",curPath="",dlFolder="";
+var activeTab="downloads",curPath="",curChannel="",folderSig="",dlFolder="";
 var allTabs=[{id:"downloads",name:"YT Downloads",builtin:true}];
 function tabOf(c){return c.tab||"downloads";}
 function tabById(id){
@@ -2642,7 +2642,7 @@ function renderTabs(list){
   });
 }
 function switchTab(id){
-  activeTab=id;curPath="";
+  activeTab=id;curPath="";curChannel="";folderSig="";
   try{pywebview.api.set_tab(id);}catch(e){}
   var t=tabById(id);
   document.getElementById("libtitle").textContent=t.name;
@@ -2665,6 +2665,18 @@ function renderSub(){
   p.className="fpath";p.title=path;
   p.innerHTML=ic("folder",12)+"<span>"+esc(path)+"</span>";
   sub.appendChild(p);
+  if(curChannel){                   // breadcrumb back out of a channel
+    var cc=document.createElement("span");cc.className="crumb";
+    var cb=document.createElement("button");
+    cb.textContent=t.name;cb.onclick=function(){goChannel("");};
+    cc.appendChild(cb);
+    var cs=document.createElement("span");cs.className="sep";cs.textContent="/";
+    cc.appendChild(cs);
+    var cn=document.createElement("button");
+    cn.textContent=curChannel;cn.className="here";
+    cc.appendChild(cn);
+    sub.appendChild(cc);
+  }
   if(curPath){                      // breadcrumb back to the library root
     var cr=document.createElement("span");cr.className="crumb";
     var segs=curPath.split("/"),html=[];
@@ -2752,31 +2764,8 @@ function updDirIcon(){
     b.title=curDir>0?"Ascending":"Descending";}
 }
 function toggleGroup(on){
-  groupOn=!!on;
+  groupOn=!!on;curChannel="";folderSig="";
   sortGrid(curSort);refreshView();saveView();
-}
-/* channel headings, inserted after visibility is settled so counts are honest */
-function applyGrouping(){
-  var old=gridEl.querySelectorAll(".ghead");
-  for(var i=0;i<old.length;i++)old[i].remove();
-  if(!groupOn||!tabById(activeTab).builtin)return;
-  var nodes=gridEl.querySelectorAll(".gc"),last=null,head=null,n=0;
-  function close(){if(head)head.querySelector(".gcount").textContent=n;}
-  for(var j=0;j<nodes.length;j++){
-    var el=nodes[j];
-    if(el.classList.contains("hide"))continue;
-    var c=cards[el.id.slice(2)]||{},ch=(c.channel||"Unknown channel").trim()||"Unknown channel";
-    if(ch!==last){
-      close();
-      head=document.createElement("div");head.className="ghead";
-      head.innerHTML=ic("user",14)+"<span>"+esc(ch)+'</span><span class="gcount">0</span>'+
-                     '<span class="grule"></span>';
-      gridEl.insertBefore(head,el);
-      last=ch;n=0;
-    }
-    n++;
-  }
-  close();
 }
 function pickSort(mode){curSort=mode;curDir=NAT[mode]||-1;updDirIcon();sortGrid(mode);saveView();}
 function flipDir(){curDir=-curDir;updDirIcon();sortGrid(curSort);saveView();}
@@ -2789,8 +2778,7 @@ function bucket(c){
   return "done";
 }
 function relOf(c){return c.rel||"";}
-/* videos stay in the folder they live in: only this level is listed, and the
-   sub-folders below it become tiles you can open */
+function chanOf(c){return (c.channel||"").trim()||"Unknown channel";}
 function inThisFolder(c){return relOf(c)===curPath;}
 function underCurrent(r){
   if(!curPath)return r;
@@ -2798,32 +2786,78 @@ function underCurrent(r){
   return r.indexOf(curPath+"/")===0?r.slice(curPath.length+1):null;
 }
 function goPath(rel){
-  curPath=rel||"";
+  curPath=rel||"";curChannel="";
   try{pywebview.api.set_path(curPath);}catch(e){}
   renderSub();refreshView();
 }
+function goChannel(name){curChannel=name||"";renderSub();refreshView();}
+/* release junk out of folder names, mirroring pretty_title() on the Python side */
+var RE_CUT=/\b(?:\d{3,4}p|4k|uhd|hdr10\+?|hdr|sdr|10bit|8bit|web[- ]?dl|web[- ]?rip|webrip|blu[- ]?ray|bluray|b[rd]rip|hdrip|dvdrip|hdtv|hdcam|camrip|x26[45]|h\.?26[45]|hevc|avc1?|xvid|divx|aac|ac3|eac3|ddp?\d|dts(?:[- ]?hd)?|atmos|truehd|dual[- ]?audio|multi(?:sub)?|esubs?|msubs?|repack|proper|remastered|amzn|dsnp|nf|hmax|sonyliv|zee5|jio|yts|yify|rarbg|psa|galaxyrg|moviesleech|tgx|ettv|eztv|hq|hd)\b/i;
+function prettyName(v){
+  var s=String(v||"").replace(/[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]/g," $1 ")
+                     .replace(/[\[\(\{][^\]\)\}]*[\]\)\}]/g," ")
+                     .replace(/[_.]/g," ");
+  var m=RE_CUT.exec(s);
+  var head=(m?s.slice(0,m.index):s).replace(/[\s\-–—_]+$/,"").trim().replace(/\s{2,}/g," ");
+  return head.length>1?head:String(v||"").replace(/\s{2,}/g," ").trim();
+}
+/* one card type for both sub-folders and channel groups, sized like a video card */
+function makeFolderCard(label, raw, count, thumbs, kind, onOpen){
+  var el=document.createElement("button");
+  el.className="fc";el.title=raw||label;
+  var pics=(thumbs||[]).slice(0,4);
+  var body=pics.length
+    ? pics.map(function(t){return '<img src="'+esc(t)+'" alt="">';}).join("")
+    : '<span class="fempty">'+ic(kind==="channel"?"user":"folder",30)+"</span>";
+  el.innerHTML='<div class="fth'+(pics.length===1?" one":"")+'">'+body+
+      '<span class="fkind">'+ic(kind==="channel"?"user":"folder",14)+"</span>"+
+      '<span class="fbadge">'+count+(count===1?" video":" videos")+"</span></div>"+
+      '<div class="gm"><div class="gt">'+esc(label)+"</div>"+
+      '<div class="gs">'+ic(kind==="channel"?"user":"folder",13)+"<span>"+
+      esc(kind==="channel"?"Channel":"Folder")+"</span></div></div>";
+  el.onclick=onOpen;
+  return el;
+}
+/* sub-folders normally; channels when the library is grouped by channel */
 function renderFolders(){
-  var box=document.getElementById("folders");if(!box)return;
-  var counts={};
-  for(var k in cards){
-    var c=cards[k];
-    if(tabOf(c)!==activeTab)continue;
-    var rest=underCurrent(relOf(c));
-    if(rest===null||rest==="")continue;
-    var first=rest.split("/")[0];
-    counts[first]=(counts[first]||0)+1;
+  var groups=[],t=tabById(activeTab);
+  var byChannel=groupOn&&t.builtin;
+  if(!curQuery&&(byChannel?!curChannel:true)){
+    var acc={};
+    for(var k in cards){
+      var c=cards[k];
+      if(tabOf(c)!==activeTab)continue;
+      var key;
+      if(byChannel){
+        if(c.status!=="done")continue;         // in-flight items stay as cards
+        key=chanOf(c);
+      }else{
+        var rest=underCurrent(relOf(c));
+        if(rest===null||rest==="")continue;
+        key=rest.split("/")[0];
+      }
+      var g=acc[key]||(acc[key]={n:0,thumbs:[]});
+      g.n++;
+      if(c.thumb&&g.thumbs.length<4)g.thumbs.push(c.thumb);
+    }
+    groups=Object.keys(acc).sort(function(a,b){return a.localeCompare(b);})
+      .map(function(name){return {name:name,n:acc[name].n,thumbs:acc[name].thumbs};});
   }
-  var names=Object.keys(counts).sort(function(a,b){return a.localeCompare(b);});
-  box.innerHTML="";
-  box.classList.toggle("on",names.length>0);
-  names.forEach(function(n){
-    var b=document.createElement("button");
-    b.className="fold";b.title=n;
-    b.innerHTML=ic("folder",15)+'<span class="fnm">'+esc(n)+'</span>'+
-                '<span class="fct">'+counts[n]+"</span>";
-    b.onclick=function(){goPath(curPath?curPath+"/"+n:n);};
-    box.appendChild(b);
-  });
+  var sig=(byChannel?"c|":"f|")+curPath+"|"+curChannel+"|"+
+          groups.map(function(g){return g.name+":"+g.n;}).join(",");
+  if(sig===folderSig)return;                    // nothing changed, keep the DOM
+  folderSig=sig;
+  var old=gridEl.querySelectorAll(".fc");
+  for(var i=0;i<old.length;i++)old[i].remove();
+  for(var j=groups.length-1;j>=0;j--){
+    (function(g){
+      var el=makeFolderCard(byChannel?g.name:prettyName(g.name),g.name,g.n,g.thumbs,
+        byChannel?"channel":"folder",
+        byChannel?function(){goChannel(g.name);}
+                : function(){goPath(curPath?curPath+"/"+g.name:g.name);});
+      gridEl.insertBefore(el,gridEl.firstChild);
+    })(groups[j]);
+  }
 }
 function refreshView(){
   var n={all:0,active:0,done:0,failed:0},shown=0,per={};
@@ -2833,8 +2867,15 @@ function refreshView(){
     per[t]=(per[t]||0)+1;
     var mine=t===activeTab;
     if(mine){n.all++;n[b]++;}
-    // a search looks through the whole library; otherwise stay in this folder
-    var here=curQuery?underCurrent(relOf(c))!==null:inThisFolder(c);
+    // a search looks through the whole library; otherwise stay in this folder/channel
+    var here;
+    if(groupOn&&tabById(activeTab).builtin){
+      if(curQuery)here=true;
+      else if(curChannel)here=chanOf(c)===curChannel;
+      else here=c.status!=="done";      // in-flight/failed stay visible above the folders
+    }else{
+      here=curQuery?underCurrent(relOf(c))!==null:inThisFolder(c);
+    }
     var hit=mine&&here&&(curFilter==="all"||curFilter===b)&&
             (!curQuery||(c.title||"").toLowerCase().indexOf(curQuery)!==-1);
     el.classList.toggle("hide",!hit);
@@ -2846,20 +2887,18 @@ function refreshView(){
   var lc=document.querySelectorAll("#tabbar .lt .lcnt");
   for(var j=0;j<lc.length&&j<allTabs.length;j++)lc[j].textContent=per[allTabs[j].id]||0;
   renderFolders();
-  applyGrouping();
   var t2=tabById(activeTab);
   var sc=document.getElementById("subcount");
   if(sc)sc.textContent=shown+(shown===1?" video":" videos");
   var e=document.getElementById("empty");
   if(e){
-    e.style.display=shown===0?"flex":"none";
+    var folders=gridEl.querySelectorAll(".fc").length;
+    e.style.display=(shown===0&&folders===0)?"flex":"none";
     var t=document.getElementById("empty-t"),ss=document.getElementById("empty-s");
     document.getElementById("empty-ic").innerHTML=ic(t2.builtin?"down":"film",26);
     if(curQuery){t.textContent="No matches";ss.textContent='Nothing here matches "'+curQuery+'"';}
     else if(curPath){t.textContent="Nothing in this folder";
-      ss.textContent=document.getElementById("folders").classList.contains("on")
-        ? "Open a sub-folder above, or drop videos here to add them to "+curPath
-        : "Drop videos here to add them to "+curPath;}
+      ss.textContent="Drop videos here to add them to "+curPath;}
     else if(!t2.builtin){t.textContent="Nothing in "+t2.name+" yet";
       ss.textContent="Drop video files here, or use the re-scan button next to the folder above";}
     else if(curFilter==="active"){t.textContent="Nothing downloading";ss.textContent="Queued and in-progress downloads show up here";}
