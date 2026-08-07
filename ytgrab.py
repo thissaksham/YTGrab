@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.8"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.9"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -692,389 +692,6 @@ def ensure_deps(push, force_ffmpeg=False):
     except Exception as e:
         push(f"[deps] ffmpeg setup failed: {e}")
     return YTDLP.exists() and FFMPEG.exists() and FFPROBE.exists()
-
-
-# === OneDrive section: rclone-backed fast browser ===
-#
-# Same idea as the legacy OneDriveFast.ps1: the sync client is built for many
-# small, frequently-edited files (block-level hashing, no per-file parallelism,
-# throttled per connection), while rclone does genuine multi-threaded chunked
-# downloads, so one big file lands several times faster. Transfers are staged
-# in %TEMP% and moved on completion, and land OUTSIDE the OneDrive folder on
-# purpose: the sync client owns everything under there and dehydrates a file
-# matching the cloud copy straight back to a placeholder.
-
-OD_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
-OD_KIND_EXTS = {
-    "pdf": {".pdf"},
-    "archive": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
-    "doc": {".doc", ".docx", ".txt", ".md", ".odt", ".rtf"},
-    "sheet": {".xls", ".xlsx", ".csv", ".ods"},
-}
-
-
-def od_find_rclone():
-    if RCLONE.exists():
-        return str(RCLONE)
-    return shutil.which("rclone")
-
-
-def od_cmd(*args):
-    # our own config file, always: the user's rclone setup is never read or
-    # written (its onedrive stanza is migrated in once by od_ensure_conf)
-    return [od_find_rclone(), "--config", str(RCLONE_CONF), *args]
-
-
-def od_ensure_rclone(push):
-    """Portable rclone into bin/ when the machine has none."""
-    if od_find_rclone():
-        return True
-    push("[od] downloading rclone... (~20 MB, one-time)")
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            zpath = Path(td) / "rclone.zip"
-            download_file(RCLONE_ZIP_URL, zpath, push, "rclone")
-            with zipfile.ZipFile(zpath) as z:
-                exe = next(n for n in z.namelist()
-                           if n.rsplit("/", 1)[-1].lower() == "rclone.exe")
-                with z.open(exe) as src, open(RCLONE, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 1 << 18)
-        push("[od] rclone ready")
-        return True
-    except Exception as e:
-        push(f"[od] rclone download failed: {e}")
-        return False
-
-
-def od_conf_remotes(text):
-    """{name: stanza} of every [remote] with type = onedrive in a config text."""
-    out = {}
-    for m in RE_STANZA.finditer(text or ""):
-        end = text.find("\n[", m.end())
-        body = text[m.end(): end if end != -1 else len(text)]
-        if re.search(r"(?im)^\s*type\s*=\s*onedrive\s*$", body):
-            out[m.group(1).strip()] = f"[{OD_REMOTE}]" + body.rstrip() + "\n"
-    return out
-
-
-def od_ensure_conf():
-    """True when our config has a onedrive remote. Migrates the user's existing
-    rclone onedrive stanza (token included) so there is no second sign-in."""
-    ours = RCLONE_CONF.read_text(encoding="utf-8", errors="replace") \
-        if RCLONE_CONF.exists() else ""
-    if od_conf_remotes(ours):
-        return True
-    if SYSTEM_RCLONE_CONF.exists():
-        try:
-            theirs = od_conf_remotes(SYSTEM_RCLONE_CONF.read_text(
-                encoding="utf-8", errors="replace"))
-        except OSError:
-            theirs = {}
-        if theirs:
-            stanza = theirs.get(OD_REMOTE) or next(iter(theirs.values()))
-            RCLONE_CONF.write_text(stanza, encoding="utf-8")
-            log("[od] migrated the onedrive remote from the existing rclone config")
-            return True
-    return False
-
-
-def od_test_remote():
-    if not od_find_rclone() or not RCLONE_CONF.exists():
-        return False
-    try:
-        r = subprocess.run(od_cmd("lsjson", f"{OD_REMOTE}:", "--max-depth", "1"),
-                           capture_output=True, creationflags=NO_WINDOW, timeout=45)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def od_lsjson(remote_dir):
-    """rclone lsjson -> parsed list, or raises with rclone's own message."""
-    r = subprocess.run(od_cmd("lsjson", f"{OD_REMOTE}:{remote_dir}", "--no-modtime"),
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", creationflags=NO_WINDOW, timeout=60)
-    if r.returncode != 0:
-        tail = (r.stderr or "").strip().splitlines()
-        raise RuntimeError(tail[-1] if tail else f"rclone exited {r.returncode}")
-    return json.loads(r.stdout or "[]")
-
-
-def od_kind_of(name, mime, is_dir):
-    if is_dir:
-        return "folder"
-    mime = (mime or "").lower()
-    ext = Path(name).suffix.lower()
-    if mime.startswith("image/") or ext in OD_IMG_EXTS:
-        return "image"
-    if mime.startswith("video/"):
-        return "video"
-    if mime.startswith("audio/"):
-        return "audio"
-    for kind, exts in OD_KIND_EXTS.items():
-        if ext in exts:
-            return kind
-    return "file"
-
-
-def od_key_of(remote):
-    return hashlib.sha1(remote.encode("utf-8")).hexdigest()[:16]
-
-
-def od_on_disk(local):
-    """Exists as real bytes; a cloud placeholder (offline/recall) doesn't count."""
-    try:
-        a = ctypes.windll.kernel32.GetFileAttributesW(str(local))
-    except Exception:
-        return False
-    if a in (-1, 0xFFFFFFFF):
-        return False
-    return not (a & 0x1000 or a & 0x400000)  # OFFLINE | RECALL_ON_DATA_ACCESS
-
-
-def od_sniff_image(path):
-    try:
-        head = Path(path).read_bytes()[:16]
-    except OSError:
-        return "application/octet-stream"
-    if head[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if head[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if head[:4] == b"GIF8":
-        return "image/gif"
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "image/webp"
-    if head[:2] == b"BM":
-        return "image/bmp"
-    return "application/octet-stream"
-
-
-# Image previews ride a tiny loopback server: the UI is one in-memory page, so
-# it cannot read file:// images -- and base64-ing whole photos through
-# evaluate_js is slow. Bound to 127.0.0.1, random port, token-gated path.
-OD_THUMB_TOKEN = os.urandom(8).hex()
-_OD_SRV = None
-
-
-def od_start_thumb_server():
-    global _OD_SRV
-    if _OD_SRV:
-        return f"http://127.0.0.1:{_OD_SRV.server_address[1]}/t/{OD_THUMB_TOKEN}/"
-    OD_THUMB_DIR.mkdir(parents=True, exist_ok=True)
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
-
-        def do_GET(self):
-            parts = self.path.strip("/").split("/")
-            if (len(parts) != 3 or parts[0] != "t" or parts[1] != OD_THUMB_TOKEN
-                    or not re.fullmatch(r"[0-9a-f]{16}", parts[2])):
-                self.send_error(404)
-                return
-            try:
-                data = (OD_THUMB_DIR / parts[2]).read_bytes()
-            except OSError:
-                self.send_error(404)
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", od_sniff_image(OD_THUMB_DIR / parts[2]))
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "max-age=31536000, immutable")
-            self.end_headers()
-            self.wfile.write(data)
-
-    _OD_SRV = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    _OD_SRV.daemon_threads = True
-    threading.Thread(target=_OD_SRV.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{_OD_SRV.server_address[1]}/t/{OD_THUMB_TOKEN}/"
-
-
-# === download pipeline ===
-
-def domain_auth(url):
-    u = url.lower()
-    if "sonyliv.com" in u:
-        f = APP_DIR / "cookies_sonyliv.txt"
-        if f.exists():
-            tok = f.read_text(encoding="utf-8").strip()
-            if tok:
-                return ["--username", "token", "--password", tok]
-    if "hotstar.com" in u:
-        f = APP_DIR / "cookies_hotstar.txt"
-        if f.exists():
-            return ["--cookies", str(f)]
-    return []
-
-
-def epoch_from_info(info):
-    ts = info.get("timestamp")
-    if ts:
-        return float(ts)
-    ud = info.get("upload_date")
-    if ud:
-        try:
-            return datetime.strptime(ud, "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()
-        except ValueError:
-            pass
-    return None
-
-
-def fmt_label(info, path):
-    ext = (path.suffix.lstrip(".").lower() if path else info.get("ext") or "")
-    h = info.get("height")
-    if h:
-        return f"{h}p {ext}".strip()
-    if info.get("acodec") and info.get("acodec") != "none" and not info.get("height"):
-        abr = info.get("abr")
-        return (f"{int(abr)}kbps " if abr else "audio ") + ext
-    return info.get("format_note") or ext or "?"
-
-
-def _short_codec(c):
-    if not c or c == "none":
-        return ""
-    c = c.lower()
-    for pre, name in (("vp9", "VP9"), ("vp09", "VP9"), ("av01", "AV1"), ("av1", "AV1"),
-                      ("avc", "H.264"), ("h264", "H.264"), ("hev", "HEVC"), ("h265", "HEVC"),
-                      ("opus", "Opus"), ("mp4a", "AAC"), ("aac", "AAC"), ("mp3", "MP3")):
-        if c.startswith(pre):
-            return name
-    return c.split(".")[0].upper()
-
-
-def _vrank(f):
-    """Sort key for choosing a video stream: prefer VP9, then AV1, then others,
-    highest bitrate within a codec. Matches the user's VP9 preference."""
-    vc = (f.get("vcodec") or "").lower()
-    pref = 0 if vc.startswith(("vp9", "vp09")) else 1 if vc.startswith(("av01", "av1")) else 2
-    return (pref, -(f.get("tbr") or 0))
-
-
-def build_vformats(data):
-    """Video formats for the custom picker; each pairs with best audio.
-    Video-only (DASH) streams preferred so audio is always the best track."""
-    try:
-        formats = data.get("formats") or []
-        auds = [f for f in formats if f.get("acodec") not in (None, "none")
-                and f.get("vcodec") in (None, "none")]
-        opus = [f for f in auds if "opus" in (f.get("acodec") or "").lower()]
-        best_aud = (max(opus, key=lambda f: (f.get("abr") or 0)) if opus
-                    else max(auds, key=lambda f: (f.get("abr") or 0), default=None))
-        aud_size = (best_aud.get("filesize") or best_aud.get("filesize_approx") or 0) if best_aud else 0
-        vids = [f for f in formats if f.get("height") and f.get("vcodec") not in (None, "none")
-                and f.get("acodec") in (None, "none")]
-        if not vids:
-            vids = [f for f in formats if f.get("height") and f.get("vcodec") not in (None, "none")]
-        if not vids:
-            return []
-        vids.sort(key=lambda f: (-(f.get("height") or 0), _vrank(f)))
-        out = []
-        for f in vids:
-            h = f.get("height")
-            vc = _short_codec(f.get("vcodec"))
-            fps = f.get("fps")
-            vid_only = f.get("acodec") in (None, "none")
-            vsize = f.get("filesize") or f.get("filesize_approx") or 0
-            size = vsize + (aud_size if vid_only else 0)
-            parts = []
-            if fps and fps >= 50:
-                parts.append(f"{int(round(fps))}fps")
-            if vc:
-                parts.append(vc)
-            if vid_only:
-                parts.append("Opus" if opus else _short_codec(best_aud.get("acodec")) if best_aud else "")
-            fid = f.get("format_id")
-            fmt = f"{fid}+ba/{fid}" if vid_only else fid
-            out.append({"label": f"{h}p", "sub": " · ".join([p for p in parts if p]),
-                        "size": ("~" + human_size(size)) if size else "", "fmt": fmt})
-        return out
-    except Exception:
-        return []
-
-
-def build_entry(info, target, vid, tab=DOWNLOADS_TAB):
-    thumb = (f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
-             if len(vid) == 11 else (info.get("thumbnail") or ""))
-    size = target.stat().st_size
-    url = info.get("webpage_url", "")
-    src = "yt" if is_youtube(url) or len(vid) == 11 else "web"
-    return {
-        "id": vid or target.stem,
-        "title": info.get("title") or target.stem,
-        "channel": info.get("uploader") or info.get("channel") or "",
-        "duration": fmt_dur(info["duration"]) if info.get("duration") else "",
-        "format": fmt_label(info, target),
-        "size": size, "size_h": human_size(size),
-        "thumb": thumb, "path": str(target), "ts": time.time(),
-        "released": epoch_from_info(info) or 0, "tab": tab, "source": src,
-    }
-
-
-def postprocess(dl_dir, started, api, mark=True, stamp=True, tab=DOWNLOADS_TAB):
-    """For each fresh .info.json: optionally stamp the file date and mark it
-    watched (with live phase updates), record a history entry, delete the json.
-    Returns the list of history entries built."""
-    push = api._push
-    entries = []
-    for jf in sorted(Path(dl_dir).glob("*.info.json"), key=lambda p: p.stat().st_mtime):
-        try:
-            if jf.stat().st_mtime < started - 5:
-                continue
-            info = json.loads(jf.read_text(encoding="utf-8"))
-            vid = info.get("id", "")
-            cands = [p for p in Path(dl_dir).iterdir()
-                     if p.suffix.lower() in VIDEO_EXTS and vid and vid in p.name]
-            target = max(cands, key=lambda p: p.stat().st_mtime) if cands else None
-            if target and stamp:
-                api._item(key=vid, status="processing", phase="Setting date")
-                epoch = epoch_from_info(info)
-                if epoch:
-                    set_file_times(target, epoch)
-                    push(f"[post] timestamp set: {target.name}")
-            url = info.get("webpage_url", "")
-            if mark and "youtube" in url and api.logged_in:
-                api._item(key=vid, status="processing", phase="Marking watched")
-                browser_mark_watched(url, push)
-            if target:
-                entries.append(build_entry(info, target, vid, tab))
-            jf.unlink(missing_ok=True)
-        except Exception as e:
-            push(f"[post] cleanup error: {e}")
-    return entries
-
-
-def is_playlist(url):
-    return ("list=" in url) or ("/@" in url)
-
-
-def is_youtube(url):
-    low = url.lower()
-    return "youtube.com" in low or "youtu.be" in low
-
-
-RE_YTID_URL = re.compile(r"(?:v=|/shorts/|youtu\.be/|/embed/|/v/|/live/)([A-Za-z0-9_-]{11})")
-
-
-def youtube_id(url):
-    m = RE_YTID_URL.search(url or "")
-    return m.group(1) if m else ""
-
-
-def yt_args(url):
-    """Player clients that keep the full format list (session cookies would drop
-    it to 0 via SABR, so we stay anonymous), plus a bundled JS runtime so yt-dlp
-    can solve YouTube's signature/n challenge. Without the runtime those fail,
-    downloads throttle, and YouTube bot-checks the session after a few videos.
-    Deno (yt-dlp's default) proved flaky here; node solved it reliably."""
-    if is_youtube(url):
-        a = ["--extractor-args", "youtube:player_client=default,web_safari"]
-        if NODE.exists():
-            a += ["--no-js-runtimes", "--js-runtimes", f"node:{NODE}"]
-        return a
-    return []
 
 
 class Api:
@@ -1926,8 +1543,7 @@ class Api:
             return {"name": label, "ok": p.exists(),
                     "where": str(p) if p.exists() else "not installed"}
         deps = [dep(YTDLP, "yt-dlp"), dep(FFMPEG, "ffmpeg"),
-                dep(FFPROBE, "ffprobe"), dep(NODE, "node (YouTube JS challenge)"),
-                dep(RCLONE, "rclone (OneDrive section)")]
+                dep(FFPROBE, "ffprobe"), dep(NODE, "node (YouTube JS challenge)")]
         return {"sites": sites, "deps": deps, "bin": short_path(BIN_DIR)}
 
     def get_supported(self, refresh=False):
@@ -3318,43 +2934,6 @@ body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
       <span id="empty-s">Paste a link above and your videos appear here</span>
     </div>
   </div>
-
-  <div id="odview">
-    <section class="odnav">
-      <button class="hact" id="odup" title="Up one folder (Backspace)" aria-label="Up one folder"
-              onclick="odUp()">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-          stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V5"/><path d="m6 11 6-6 6 6"/></svg>
-      </button>
-      <nav class="crumb" id="odcrumb" aria-label="OneDrive location"></nav>
-      <span class="sp"></span>
-      <span class="subcount" id="odcount"></span>
-      <div class="searchwrap">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-          stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input type="text" id="odq" placeholder="Filter this folder" spellcheck="false"
-               aria-label="Filter this folder" oninput="odRender()">
-      </div>
-      <button class="hact" title="Refresh (F5)" aria-label="Refresh OneDrive folder" onclick="odGo(odPath,true)">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-          stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
-      </button>
-    </section>
-    <section class="odsub">
-      <button class="fpath destpill" id="oddestpill" onclick="odPickDest()"
-              title="OneDrive downloads land here - click to change">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-          stroke-linecap="round" stroke-linejoin="round"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2z"/></svg>
-        <span id="oddest">&hellip;</span>
-      </button>
-      <button class="hactx" onclick="pywebview.api.od_open_dest()">Open folder</button>
-      <span class="subdot">&middot;</span>
-      <button class="hactx" id="odconn" onclick="odReconnect()">
-        <span class="oddot" id="odconndot"></span><span id="odconntxt">Connect</span>
-      </button>
-    </section>
-    <div id="odgrid"></div>
-  </div>
 </main>
 </div>
 
@@ -4169,10 +3748,7 @@ function odGo(path){
     g.innerHTML='<div class="empty"><b>Could not read this folder</b></div>';
   });
 }
-function odUp(){
-  if(!odPath)return;
-  odGo(odPath.indexOf("/")===-1?"":odPath.slice(0,odPath.lastIndexOf("/")));
-}
+
 function odCrumb(){
   var c=document.getElementById("odcrumb");c.innerHTML="";
   var root=document.createElement("button");
@@ -4190,9 +3766,7 @@ function odCrumb(){
   });
   document.getElementById("odup").disabled=!odPath;
 }
-function odRender(){
-  var q=(document.getElementById("odq").value||"").trim().toLowerCase();
-  var list=q?odEntries.filter(function(e){return e.name.toLowerCase().indexOf(q)!==-1;}):odEntries;
+):odEntries;
   var nf=0;odEntries.forEach(function(e){if(e.isdir)nf++;});
   document.getElementById("odcount").textContent=odEntries.length?
     nf+" folder"+(nf===1?"":"s")+" · "+(odEntries.length-nf)+" files":"";
@@ -4350,12 +3924,7 @@ function odPickDest(){
     if(odReady&&odConnected)odGo(odPath);   // on-disk flags depend on the dest
   });
 }
-function odReconnect(){
-  if(odConnected&&!confirm("Re-run the OneDrive sign-in?\n\n"+
-     "A console window opens and walks you through it."))return;
-  pywebview.api.od_reconnect();
-  toast("OneDrive sign-in window opening…");
-}
+
 document.addEventListener("keydown",function(e){
   if(!odMode)return;
   var typing=document.activeElement===document.getElementById("odq");
