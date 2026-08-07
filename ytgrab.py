@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.14.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.14.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -3946,7 +3946,7 @@ function odCard(e){
       if(e.ondisk)pywebview.api.od_open_local(e.remote);
     });
   }
-  odPaint(e.key,e);
+  odPaintEl(el,e);   // paint before attach: getElementById can't see fragments
   return el;
 }
 function odStateHtml(e){
@@ -3972,7 +3972,12 @@ function odStateHtml(e){
 function odPaint(key,e){
   if(!e)for(var i=0;i<odEntries.length;i++)if(odEntries[i].key===key){e=odEntries[i];break;}
   if(!e)return;
-  var s=document.getElementById("ods-"+key);
+  var card=document.getElementById("odg-"+key);
+  if(card)odPaintEl(card,e);
+}
+function odPaintEl(card,e){
+  var key=e.key;
+  var s=card.querySelector(".gs");
   if(s){
     s.innerHTML=odStateHtml(e);
     var b=s.querySelector("[data-act=dl]");
@@ -3981,7 +3986,7 @@ function odPaint(key,e){
       pywebview.api.od_download(e.remote,e.name);
     };
   }
-  var a=document.getElementById("oda-"+key);
+  var a=card.querySelector(".gacts");
   if(a&&!e.isdir){
     var j=odJobs[key]||{};var st=j.status||e.job||"";
     a.innerHTML="";
@@ -3997,18 +4002,15 @@ function odPaint(key,e){
       a.children[1].onclick=function(ev){ev.stopPropagation();pywebview.api.od_reveal_local(e.remote);};
     }
   }
-  var card=document.getElementById("odg-"+key);
-  if(card){
-    var jj=odJobs[key]||{};
-    card.classList.toggle("running",(jj.status||e.job)==="running");
-    var bar=card.querySelector(".gprog i");
-    if(bar&&jj.pct!=null)bar.style.width=jj.pct+"%";
-    var badge=card.querySelector(".gbadge");
-    if(badge&&!e.isdir){
-      if(jj.status==="running"){badge.textContent=Math.round(jj.pct||0)+"%";badge.className="gbadge";}
-      else if(e.ondisk||jj.status==="done"){badge.textContent="On disk";badge.className="gbadge on";}
-      else{badge.textContent=e.size_h;badge.className="gbadge";}
-    }
+  var jj=odJobs[key]||{};
+  card.classList.toggle("running",(jj.status||e.job)==="running");
+  var bar=card.querySelector(".gprog i");
+  if(bar&&jj.pct!=null)bar.style.width=jj.pct+"%";
+  var badge=card.querySelector(".gbadge");
+  if(badge&&!e.isdir){
+    if(jj.status==="running"){badge.textContent=Math.round(jj.pct||0)+"%";badge.className="gbadge";}
+    else if(e.ondisk||jj.status==="done"){badge.textContent="On disk";badge.className="gbadge on";}
+    else{badge.textContent=e.size_h;badge.className="gbadge";}
   }
 }
 ui.odjob=function(o){
