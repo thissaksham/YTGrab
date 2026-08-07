@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1093,15 +1093,25 @@ class Api:
         self.active_path = ""                      # sub-folder open in that tab
         self._trash = None                         # last removed library, for undo
         migrated = False
-        for e in self.history:     # entries predating tabs or miscategorized: sort them into correct tab
+        RE_YTID = re.compile(r"\[([a-zA-Z0-9_-]{11})\]")
+        for e in self.history:     # auto-heal YouTube videos mistakenly indexed into imported
             vid = str(e.get("id") or "")
-            src = e.get("source") or ""
-            if src in ("yt", "web") or len(vid) == 11 or e.get("channel"):
+            path_str = str(e.get("path") or e.get("file") or e.get("title") or "")
+            m = RE_YTID.search(path_str)
+            if m:
+                yid = m.group(1)
+                if e.get("tab") != DOWNLOADS_TAB or e.get("source") != "yt" or e.get("id") != yid:
+                    e["id"] = yid
+                    e["source"] = "yt"
+                    e["tab"] = DOWNLOADS_TAB
+                    e["thumb"] = f"https://i.ytimg.com/vi/{yid}/mqdefault.jpg"
+                    migrated = True
+            elif e.get("source") in ("yt", "web") or len(vid) == 11 or e.get("channel"):
                 if e.get("tab") == "imported":
                     e["tab"] = DOWNLOADS_TAB
                     migrated = True
             elif not e.get("tab"):
-                e["tab"] = "imported" if src == "local" else DOWNLOADS_TAB
+                e["tab"] = "imported" if e.get("source") == "local" else DOWNLOADS_TAB
                 migrated = True
             # local titles used to be the raw filename; tidy them once
             if e.get("source") == "local" and not e.get("file"):
@@ -1950,23 +1960,35 @@ class Api:
                  "size": size, "size_h": human_size(size), "kind": kind,
                  "ondisk": False if is_dir else od_on_disk(self.od_local(remote)),
                  "job": job["status"] if job and job["status"] in ("queued", "running") else ""}
-            if kind == "image" and 0 < size <= OD_THUMB_MAX:
-                if key in od["thumb_done"]:
+            if kind in ("image", "video") and 0 < size:
+                if kind == "image" and size > OD_THUMB_MAX:
+                    pass
+                elif key in od["thumb_done"]:
                     e["thumb"] = key
                 else:
-                    od["thumbs"].submit(self._od_fetch_thumb, remote, key)
+                    od["thumbs"].submit(self._od_fetch_thumb, remote, key, kind)
             entries.append(e)
         entries.sort(key=lambda e: (not e["isdir"], e["name"].lower()))
         return {"ok": True, "path": path, "entries": entries}
 
-    def _od_fetch_thumb(self, remote, key):
+    def _od_fetch_thumb(self, remote, key, kind="image"):
         dest = OD_THUMB_DIR / key
         tmp = dest.with_suffix(".part")
         try:
-            r = subprocess.run(od_cmd("copyto", f"{OD_REMOTE}:{remote}", str(tmp),
-                                      "--ignore-times"),
-                               capture_output=True, creationflags=NO_WINDOW, timeout=300)
-            if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            if kind == "video":
+                sample = dest.with_suffix(".sample")
+                cmd = od_cmd("cat", f"{OD_REMOTE}:{remote}", "--head", "5M")
+                with open(sample, "wb") as f:
+                    subprocess.run([str(c) for c in cmd], stdout=f, stderr=subprocess.DEVNULL,
+                                   creationflags=NO_WINDOW, timeout=60)
+                if sample.exists() and sample.stat().st_size > 0:
+                    make_thumb(sample, tmp, 0)
+                sample.unlink(missing_ok=True)
+            else:
+                r = subprocess.run(od_cmd("copyto", f"{OD_REMOTE}:{remote}", str(tmp),
+                                          "--ignore-times"),
+                                   capture_output=True, creationflags=NO_WINDOW, timeout=120)
+            if tmp.exists() and tmp.stat().st_size > 0:
                 tmp.replace(dest)
                 self._od["thumb_done"].add(key)
                 if UI_WIN:
@@ -2038,14 +2060,16 @@ class Api:
                      "--multi-thread-streams", str(int(self.cfg.get("od_streams") or 8)),
                      "--multi-thread-cutoff", "10M",
                      "--buffer-size", "64M",
-                     "--onedrive-chunk-size", "64M",
+                     "--onedrive-chunk-size", "50M",
                      "--stats", "1s", "--stats-one-line", "--stats-log-level", "NOTICE")
         proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                 errors="replace", creationflags=NO_WINDOW)
         j["proc"] = proc
         last = 0.0
+        err_lines = []
         for line in proc.stderr:
+            err_lines.append(line.strip())
             m = RE_OD_STATS.search(line or "")
             if not m:
                 continue
@@ -2066,9 +2090,9 @@ class Api:
         if proc.returncode != 0:
             stage.unlink(missing_ok=True)
             j["status"] = "error"
-            self._push(f"[od] {j['name']}: rclone exited {proc.returncode}")
-            self._od_job_push(key, status="error",
-                              error=f"rclone exited {proc.returncode}")
+            err_msg = next((l for l in reversed(err_lines) if l and "NOTICE" not in l), f"rclone exited {proc.returncode}")
+            self._push(f"[od] {j['name']} failed: {err_msg}")
+            self._od_job_push(key, status="error", error=err_msg[:160])
             return
 
         # staging keeps a half-finished transfer out of the destination
@@ -2639,6 +2663,7 @@ svg{flex:none;}
   background:transparent;color:var(--mut);display:inline-flex;align-items:center;
   justify-content:center;cursor:pointer;transition:background .18s var(--ease),color .18s var(--ease);}
 .ib:hover{background:var(--s2);color:var(--tx);}
+#conbtn{margin-left:auto;}
 /* status rides on the control it belongs to, not in a far-off corner */
 .idot{position:absolute;right:1px;bottom:1px;width:9px;height:9px;border-radius:50%;
   background:var(--warn);border:2px solid var(--bg);}
