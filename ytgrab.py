@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.4"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.5"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1115,8 +1115,77 @@ class Api:
                 e["file"] = Path(e.get("path") or e.get("title") or "").name
                 e["title"] = pretty_title(Path(e["file"]).stem or e.get("title") or "")
                 migrated = True
+
+        # ── one-time v1.15.5 migration: fix wrongly-assigned tabs ──
+        if self.cfg.get("_mig") != "1.15.5":
+            # Build lookup: normalised folder → tab id (longest first)
+            tab_dirs = []
+            for t in self.tabs:
+                tid = t["id"]
+                tf = os.path.normpath(self.tab_folder(tid)).lower()
+                tab_dirs.append((tf, tid))
+            base = os.path.normpath(self.download_dir()).lower()
+            tab_dirs.append((os.path.join(base, "youtube"), DOWNLOADS_TAB))
+            tab_dirs.append((os.path.join(base, "imported"), "imported"))
+            # Also match download_dir root itself → downloads
+            tab_dirs.append((base, DOWNLOADS_TAB))
+            tab_dirs.sort(key=lambda x: len(x[0]), reverse=True)
+
+            for e in self.history:
+                p = e.get("path", "")
+                if not p:
+                    continue
+                p_lower = os.path.normpath(p).lower()
+                matched = None
+                for tf, tid in tab_dirs:
+                    if tf and (p_lower == tf or p_lower.startswith(tf + os.sep)):
+                        matched = tid
+                        break
+                if matched and e.get("tab") != matched:
+                    e["tab"] = matched
+                    migrated = True
+                elif not matched and e.get("tab") == "imported":
+                    # Path doesn't match ANY registered folder — shouldn't be in imported
+                    imp_folder = os.path.normpath(self.tab_folder("imported")).lower()
+                    if not (p_lower == imp_folder or p_lower.startswith(imp_folder + os.sep)):
+                        e["tab"] = DOWNLOADS_TAB
+                        migrated = True
+
+            self.cfg["_mig"] = "1.15.5"
+            save_config(self.cfg)
+
         if migrated:
             save_history(self.history)
+
+        # ── background: backfill missing channel info for YT entries ──
+        missing_ch = [(i, e) for i, e in enumerate(self.history)
+                      if e.get("source") == "yt" and not e.get("channel")]
+        if missing_ch:
+            def _backfill_channels(entries, hist_ref):
+                ytdlp = str(BIN / "yt-dlp.exe")
+                RE = re.compile(r"\[([a-zA-Z0-9_-]{11})\]")
+                changed = False
+                for idx, e in entries:
+                    m = RE.search(e.get("path") or e.get("file") or "")
+                    if not m:
+                        continue
+                    vid = m.group(1)
+                    try:
+                        r = subprocess.run(
+                            [ytdlp, "--print", "%(uploader)s", "--no-download",
+                             "--no-warnings", "-q", f"https://youtu.be/{vid}"],
+                            capture_output=True, text=True, timeout=15)
+                        ch = (r.stdout or "").strip()
+                        if ch:
+                            e["channel"] = ch
+                            changed = True
+                    except Exception:
+                        pass
+                if changed:
+                    save_history(hist_ref)
+            threading.Thread(target=_backfill_channels,
+                             args=(missing_ch, self.history),
+                             daemon=True).start()
         self.proc = None
         self.busy = False
         self.logged_in = False
