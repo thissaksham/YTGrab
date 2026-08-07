@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.3"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.4"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1094,21 +1094,17 @@ class Api:
         self._trash = None                         # last removed library, for undo
         migrated = False
         RE_YTID = re.compile(r"\[([a-zA-Z0-9_-]{11})\]")
-        for e in self.history:     # strictly assign entries to the library owning their folder path
-            path, ok = self.resolve_entry_path(e)
-            matched = self.tab_for_path(path)
-            if matched and e.get("tab") != matched:
-                e["tab"] = matched
-                migrated = True
-            elif not e.get("tab"):
+        for e in self.history:
+            # Only assign a tab if the entry has none at all
+            if not e.get("tab"):
                 e["tab"] = DOWNLOADS_TAB if e.get("source") in ("yt", "web") else "imported"
                 migrated = True
 
             # If it's a YouTube download missing thumbnail, link official thumbnail
-            m = RE_YTID.search(str(path))
+            m = RE_YTID.search(str(e.get("path") or e.get("file") or ""))
             if m:
                 yid = m.group(1)
-                if not e.get("thumb") or e.get("thumb").startswith("data:"):
+                if not e.get("thumb") or e.get("thumb", "").startswith("data:"):
                     e["id"] = yid
                     e["source"] = "yt"
                     e["thumb"] = f"https://i.ytimg.com/vi/{yid}/mqdefault.jpg"
@@ -1659,45 +1655,12 @@ class Api:
 
         return str(old_path), False
 
-    def tab_for_path(self, path_str):
-        """Strictly resolve which library tab owns a file based on its physical folder path on disk."""
-        if not path_str:
-            return None
-        p_lower = os.path.normpath(path_str).lower()
-
-        tab_dirs = []
-        for t in self.tabs:
-            tid = t["id"]
-            tf = os.path.normpath(self.tab_folder(tid)).lower()
-            tab_dirs.append((tf, tid))
-
-        base = os.path.normpath(self.download_dir()).lower()
-        tab_dirs.append((os.path.join(base, "youtube"), DOWNLOADS_TAB))
-        tab_dirs.append((os.path.join(base, "imported"), "imported"))
-
-        tab_dirs.sort(key=lambda x: len(x[0]), reverse=True)
-
-        for tf, tid in tab_dirs:
-            if tf and (p_lower == tf or p_lower.startswith(tf + os.sep)):
-                return tid
-
-        if "imported" in p_lower or "comedy" in p_lower:
-            return "imported"
-        if "youtube" in p_lower:
-            return DOWNLOADS_TAB
-
-        return None
-
     def get_history(self):
         migrated = False
         res = []
         for e in self.history:
             path, ok = self.resolve_entry_path(e)
-            matched_tab = self.tab_for_path(path)
-            if matched_tab and e.get("tab") != matched_tab:
-                e["tab"] = matched_tab
-                migrated = True
-            if ok and path != e.get("path"):
+            if ok and path != e.get("_prev_path"):
                 migrated = True
             res.append({**e, "thumb": entry_thumb(e),
                         "rel": rel_dir(e.get("path", ""), self.tab_folder(e.get("tab") or DOWNLOADS_TAB)),
