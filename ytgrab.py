@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.10"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.11"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -694,6 +694,206 @@ def ensure_deps(push, force_ffmpeg=False):
     return YTDLP.exists() and FFMPEG.exists() and FFPROBE.exists()
 
 
+# === OneDrive section: rclone-backed fast browser ===
+#
+# Same idea as the legacy OneDriveFast.ps1: the sync client is built for many
+# small, frequently-edited files (block-level hashing, no per-file parallelism,
+# throttled per connection), while rclone does genuine multi-threaded chunked
+# downloads, so one big file lands several times faster. Transfers are staged
+# in %TEMP% and moved on completion, and land OUTSIDE the OneDrive folder on
+# purpose: the sync client owns everything under there and dehydrates a file
+# matching the cloud copy straight back to a placeholder.
+
+OD_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+OD_KIND_EXTS = {
+    "pdf": {".pdf"},
+    "archive": {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
+    "doc": {".doc", ".docx", ".txt", ".md", ".odt", ".rtf"},
+    "sheet": {".xls", ".xlsx", ".csv", ".ods"},
+}
+
+
+def od_find_rclone():
+    if RCLONE.exists():
+        return str(RCLONE)
+    return shutil.which("rclone")
+
+
+def od_cmd(*args):
+    # our own config file, always: the user's rclone setup is never read or
+    # written (its onedrive stanza is migrated in once by od_ensure_conf)
+    return [od_find_rclone(), "--config", str(RCLONE_CONF), *args]
+
+
+def od_ensure_rclone(push):
+    """Portable rclone into bin/ when the machine has none."""
+    if od_find_rclone():
+        return True
+    push("[od] downloading rclone... (~20 MB, one-time)")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            zpath = Path(td) / "rclone.zip"
+            download_file(RCLONE_ZIP_URL, zpath, push, "rclone")
+            with zipfile.ZipFile(zpath) as z:
+                exe = next(n for n in z.namelist()
+                           if n.rsplit("/", 1)[-1].lower() == "rclone.exe")
+                with z.open(exe) as src, open(RCLONE, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 18)
+        push("[od] rclone ready")
+        return True
+    except Exception as e:
+        push(f"[od] rclone download failed: {e}")
+        return False
+
+
+def od_conf_remotes(text):
+    """{name: stanza} of every [remote] with type = onedrive in a config text."""
+    out = {}
+    for m in RE_STANZA.finditer(text or ""):
+        end = text.find("\n[", m.end())
+        body = text[m.end(): end if end != -1 else len(text)]
+        if re.search(r"(?im)^\s*type\s*=\s*onedrive\s*$", body):
+            out[m.group(1).strip()] = f"[{OD_REMOTE}]" + body.rstrip() + "\n"
+    return out
+
+
+def od_ensure_conf():
+    """True when our config has a onedrive remote. Migrates the user's existing
+    rclone onedrive stanza (token included) so there is no second sign-in."""
+    ours = RCLONE_CONF.read_text(encoding="utf-8", errors="replace") \
+        if RCLONE_CONF.exists() else ""
+    if od_conf_remotes(ours):
+        return True
+    if SYSTEM_RCLONE_CONF.exists():
+        try:
+            theirs = od_conf_remotes(SYSTEM_RCLONE_CONF.read_text(
+                encoding="utf-8", errors="replace"))
+        except OSError:
+            theirs = {}
+        if theirs:
+            stanza = theirs.get(OD_REMOTE) or next(iter(theirs.values()))
+            RCLONE_CONF.write_text(stanza, encoding="utf-8")
+            log("[od] migrated the onedrive remote from the existing rclone config")
+            return True
+    return False
+
+
+def od_test_remote():
+    if not od_find_rclone() or not RCLONE_CONF.exists():
+        return False
+    try:
+        r = subprocess.run(od_cmd("lsjson", f"{OD_REMOTE}:", "--max-depth", "1"),
+                           capture_output=True, creationflags=NO_WINDOW, timeout=45)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def od_lsjson(remote_dir):
+    """rclone lsjson -> parsed list, or raises with rclone's own message."""
+    r = subprocess.run(od_cmd("lsjson", f"{OD_REMOTE}:{remote_dir}", "--no-modtime"),
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", creationflags=NO_WINDOW, timeout=60)
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        raise RuntimeError(tail[-1] if tail else f"rclone exited {r.returncode}")
+    return json.loads(r.stdout or "[]")
+
+
+def od_kind_of(name, mime, is_dir):
+    if is_dir:
+        return "folder"
+    mime = (mime or "").lower()
+    ext = Path(name).suffix.lower()
+    if mime.startswith("image/") or ext in OD_IMG_EXTS:
+        return "image"
+    if mime.startswith("video/"):
+        return "video"
+    if mime.startswith("audio/"):
+        return "audio"
+    for kind, exts in OD_KIND_EXTS.items():
+        if ext in exts:
+            return kind
+    return "file"
+
+
+def od_key_of(remote):
+    return hashlib.sha1(remote.encode("utf-8")).hexdigest()[:16]
+
+
+def od_on_disk(local):
+    """Exists as real bytes; a cloud placeholder (offline/recall) doesn't count."""
+    try:
+        a = ctypes.windll.kernel32.GetFileAttributesW(str(local))
+    except Exception:
+        return False
+    if a in (-1, 0xFFFFFFFF):
+        return False
+    return not (a & 0x1000 or a & 0x400000)  # OFFLINE | RECALL_ON_DATA_ACCESS
+
+
+def od_sniff_image(path):
+    try:
+        head = Path(path).read_bytes()[:16]
+    except OSError:
+        return "application/octet-stream"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:4] == b"GIF8":
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:2] == b"BM":
+        return "image/bmp"
+    return "application/octet-stream"
+
+
+# Image previews ride a tiny loopback server: the UI is one in-memory page, so
+# it cannot read file:// images -- and base64-ing whole photos through
+# evaluate_js is slow. Bound to 127.0.0.1, random port, token-gated path.
+OD_THUMB_TOKEN = os.urandom(8).hex()
+_OD_SRV = None
+
+
+def od_start_thumb_server():
+    global _OD_SRV
+    if _OD_SRV:
+        return f"http://127.0.0.1:{_OD_SRV.server_address[1]}/t/{OD_THUMB_TOKEN}/"
+    OD_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            parts = self.path.strip("/").split("/")
+            if (len(parts) != 3 or parts[0] != "t" or parts[1] != OD_THUMB_TOKEN
+                    or not re.fullmatch(r"[0-9a-f]{16}", parts[2])):
+                self.send_error(404)
+                return
+            try:
+                data = (OD_THUMB_DIR / parts[2]).read_bytes()
+            except OSError:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", od_sniff_image(OD_THUMB_DIR / parts[2]))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=31536000, immutable")
+            self.end_headers()
+            self.wfile.write(data)
+
+    _OD_SRV = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    _OD_SRV.daemon_threads = True
+    threading.Thread(target=_OD_SRV.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{_OD_SRV.server_address[1]}/t/{OD_THUMB_TOKEN}/"
+
+
+# === download pipeline ===
+
 def domain_auth(url):
     u = url.lower()
     if "sonyliv.com" in u:
@@ -1133,11 +1333,13 @@ class Api:
             "set_timestamp": self.cfg.get("set_timestamp", True)
         }
 
-    def set_settings(self, download_dir=None, use_subfolders=None, mark_watched=None, set_timestamp=None):
+    def set_settings(self, download_dir=None, use_subfolders=None, od_streams=None, mark_watched=None, set_timestamp=None):
         if download_dir is not None and Path(download_dir).exists():
             self.cfg["download_dir"] = download_dir
         if use_subfolders is not None:
             self.cfg["use_subfolders"] = bool(use_subfolders)
+        if od_streams is not None:
+            self.cfg["od_streams"] = int(od_streams)
         if mark_watched is not None:
             self.cfg["mark_watched"] = bool(mark_watched)
         if set_timestamp is not None:
@@ -1796,6 +1998,301 @@ class Api:
         return "updating"
 
     # --- OneDrive (fast rclone browser) ---
+
+    def od_dest(self):
+        d = self.cfg.get("od_dest")
+        if d and Path(d).exists():
+            return d
+        return self.subfolder_path("onedrive")
+
+    def od_local(self, remote):
+        return Path(self.od_dest()) / Path(*remote.split("/"))
+
+    def od_pick_dest(self):
+        res = UI_WIN.create_file_dialog(webview.FOLDER_DIALOG, directory=self.od_dest())
+        if res:
+            self.cfg["od_dest"] = res[0]
+            save_config(self.cfg)
+        return self.od_dest()
+
+    def od_open_dest(self):
+        d = Path(self.od_dest())
+        d.mkdir(parents=True, exist_ok=True)
+        os.startfile(d)
+        return "ok"
+
+    def od_open(self):
+        """First open of the section: rclone + sign-in + the preview server.
+        Runs inside the JS promise's thread, so a slow first call (rclone
+        download, token refresh) never freezes the window."""
+        od = self._od
+        if not od["opened"]:
+            od["opened"] = True
+            od_ensure_rclone(self._push)
+            if od_ensure_conf():
+                self._push("[od] checking the OneDrive connection...")
+                od["connected"] = od_test_remote()
+                self._push("[od] connected" if od["connected"] else
+                           "[od] sign-in expired - use Connect in the OneDrive section")
+            else:
+                self._push("[od] no OneDrive sign-in found - use Connect in the OneDrive section")
+            od["tbase"] = od_start_thumb_server()
+            od["thumb_done"] = {p.name for p in OD_THUMB_DIR.glob("*")
+                                if re.fullmatch(r"[0-9a-f]{16}", p.name)}
+        return {"connected": od["connected"], "dest": self.od_dest(),
+                "tbase": od["tbase"], "rclone": bool(od_find_rclone())}
+
+    def od_reconnect(self):
+        threading.Thread(target=self._od_reconnect_worker, daemon=True).start()
+        return "started"
+
+    def _od_reconnect_worker(self):
+        if not od_find_rclone():
+            self._push("[od] rclone isn't installed yet")
+            return
+        have = od_ensure_conf()
+        cmd = [od_find_rclone(), "--config", str(RCLONE_CONF), "config"]
+        cmd += (["reconnect", f"{OD_REMOTE}:", "--auto-confirm"] if have
+                else ["create", OD_REMOTE, "onedrive", "region=global"])
+        self._push("[od] a console window opened - sign in there, it closes itself")
+        try:
+            subprocess.Popen(cmd, creationflags=NEW_CONSOLE).wait(timeout=600)
+        except Exception as e:
+            self._push(f"[od] sign-in failed: {e}")
+            return
+        self._od["connected"] = od_test_remote()
+        self._push("[od] signed in" if self._od["connected"]
+                   else "[od] still not connected")
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js("ui.odstate({connected:%s})"
+                                   % ("true" if self._od["connected"] else "false"))
+            except Exception:
+                pass
+
+    def od_list(self, path):
+        path = (path or "").strip("/")
+        try:
+            raw = od_lsjson(path)
+        except Exception as e:
+            self._push(f"[od] listing failed: {str(e)[:160]}")
+            return {"ok": False, "path": path, "error": str(e)[:200]}
+        od = self._od
+        entries = []
+        for it in raw:
+            name = it.get("Name") or ""
+            if not name:
+                continue
+            remote = f"{path}/{name}" if path else name
+            is_dir = bool(it.get("IsDir"))
+            size = max(int(it.get("Size") or 0), 0)
+            kind = od_kind_of(name, it.get("MimeType"), is_dir)
+            key = od_key_of(remote)
+            job = od["jobs"].get(key)
+            e = {"key": key, "name": name, "remote": remote, "isdir": is_dir,
+                 "size": size, "size_h": human_size(size), "kind": kind,
+                 "ondisk": False if is_dir else od_on_disk(self.od_local(remote)),
+                 "job": job["status"] if job and job["status"] in ("queued", "running") else ""}
+            # Graph API supports thumbnails for almost everything (images, videos, PDFs, docs, etc)
+            if not is_dir:
+                if key in od["thumb_done"]:
+                    e["thumb"] = key
+                elif it.get("ID"):
+                    od["thumbs"].submit(self._od_fetch_thumb, it.get("ID"), key)
+            entries.append(e)
+        entries.sort(key=lambda e: (not e["isdir"], e["name"].lower()))
+        return {"ok": True, "path": path, "entries": entries}
+
+    def _od_fetch_thumb(self, item_id, key):
+        dest = OD_THUMB_DIR / key
+        tmp = dest.with_suffix(".part")
+        try:
+            # 1. Parse token from rclone.conf
+            config = configparser.ConfigParser()
+            config.read(SYSTEM_RCLONE_CONF)
+            token = json.loads(config[OD_REMOTE]["token"])
+            acc = token["access_token"]
+            drive_id = config[OD_REMOTE]["drive_id"]
+            
+            # 2. Get thumbnail URL from Graph API
+            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/thumbnails/0/large/content"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {acc}"})
+            
+            # 3. Download the thumbnail
+            with urllib.request.urlopen(req, timeout=10) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            
+            if tmp.exists() and tmp.stat().st_size > 0:
+                tmp.replace(dest)
+                self._od["thumb_done"].add(key)
+                if UI_WIN:
+                    try:
+                        UI_WIN.evaluate_js(f"ui.odthumb({json.dumps(key)})")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def od_download(self, remote, name):
+        if not od_find_rclone():
+            return "no-rclone"
+        od = self._od
+        key = od_key_of(remote)
+        with od["lock"]:
+            j = od["jobs"].get(key)
+            if j and j["status"] in ("queued", "running"):
+                return "dup"
+            od["jobs"][key] = {"status": "queued", "pct": 0, "speed": "", "eta": "",
+                               "name": name or Path(remote).name, "remote": remote,
+                               "proc": None}
+            if not od["workers"]:
+                od["workers"] = True
+                for _ in range(OD_DL_WORKERS):
+                    threading.Thread(target=self._od_dl_loop, daemon=True).start()
+            od["q"].put(key)
+        self._od_job_push(key, status="queued", name=od["jobs"][key]["name"])
+        self._od_strip_push()
+        return "queued"
+
+    def _od_job_push(self, key, **kw):
+        kw["key"] = key
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js(f"ui.odjob({json.dumps(kw)})")
+            except Exception:
+                pass
+
+    def _od_dl_loop(self):
+        while True:
+            key = self._od["q"].get()
+            try:
+                self._od_dl_one(key)
+            except Exception as e:
+                self._push(f"[od] download error: {e}")
+                j = self._od["jobs"].get(key)
+                if j and j["status"] == "running":
+                    j["status"] = "error"
+                    self._od_job_push(key, status="error", error=str(e)[:160])
+            finally:
+                self._od["q"].task_done()
+                self._od_strip_push()
+
+    def _od_dl_one(self, key):
+        j = self._od["jobs"][key]
+        if j["status"] == "cancelled":
+            return
+        remote = j["remote"]
+        final = self.od_local(remote)
+        stage = OD_STAGE_DIR / (os.urandom(6).hex() + "_" + j["name"])
+        OD_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+        j["status"] = "running"
+        self._od_job_push(key, status="running", pct=0)
+        self._od_strip_push()
+        cmd = od_cmd("copyto", f"{OD_REMOTE}:{remote}", str(stage),
+                     "--multi-thread-streams", str(int(self.cfg.get("od_streams") or 16)),
+                     "--stats", "1s", "--stats-one-line", "--stats-log-level", "NOTICE")
+        proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                errors="replace", creationflags=NO_WINDOW)
+        j["proc"] = proc
+        last = 0.0
+        err_lines = []
+        for line in proc.stderr:
+            err_lines.append(line.strip())
+            m = RE_OD_STATS.search(line or "")
+            if not m:
+                continue
+            now = time.time()
+            if now - last < 0.35:      # paint at ~3 fps, not per stats line
+                continue
+            last = now
+            j["pct"], j["speed"], j["eta"] = int(m.group(1)), m.group(2) + "/s", m.group(3)
+            self._od_job_push(key, status="running", pct=j["pct"],
+                              speed=j["speed"], eta=j["eta"])
+            self._od_strip_push()
+        proc.wait()
+        j["proc"] = None
+
+        if j["status"] == "cancelled":
+            stage.unlink(missing_ok=True)
+            return
+        if proc.returncode != 0:
+            stage.unlink(missing_ok=True)
+            j["status"] = "error"
+            err_msg = next((l for l in reversed(err_lines) if l and "NOTICE" not in l), f"rclone exited {proc.returncode}")
+            self._push(f"[od] {j['name']} failed: {err_msg}")
+            self._od_job_push(key, status="error", error=err_msg[:160])
+            return
+
+        # staging keeps a half-finished transfer out of the destination
+        final.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(stage), str(final))
+        j["pct"], j["status"] = 100, "done"
+        self._push(f"[od] saved: {final}")
+        self._od_job_push(key, status="done", pct=100, ondisk=True)
+
+    def od_cancel(self, remote):
+        key = od_key_of(remote)
+        j = self._od["jobs"].get(key)
+        if not j or j["status"] not in ("queued", "running"):
+            return "none"
+        j["status"] = "cancelled"
+        p = j.get("proc")
+        if p and p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        self._od_job_push(key, status="cancelled")
+        self._push(f"[od] cancelled: {j['name']}")
+        self._od_strip_push()
+        return "ok"
+
+    def od_cancel_all(self):
+        n = 0
+        for remote in [j["remote"] for j in self._od["jobs"].values()
+                       if j["status"] in ("queued", "running")]:
+            if self.od_cancel(remote) == "ok":
+                n += 1
+        return n
+
+    def _od_strip_push(self):
+        agg = {"active": 0, "queued": 0, "speed": 0.0, "name": "", "pct": 0}
+        for j in self._od["jobs"].values():
+            if j["status"] == "queued":
+                agg["queued"] += 1
+            elif j["status"] == "running":
+                agg["active"] += 1
+                agg["name"] = j["name"]
+                agg["pct"] = j["pct"]
+                sm = re.match(r"([\d.]+)\s*([KMGT]?)i?B/s", j.get("speed") or "")
+                if sm:
+                    mul = {"": 1 / 1024, "K": 1 / 1024, "M": 1, "G": 1024,
+                           "T": 1024 * 1024}[sm.group(2) or "M"]
+                    agg["speed"] += float(sm.group(1)) * mul
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js(f"ui.odstrip({json.dumps(agg)})")
+            except Exception:
+                pass
+
+    def od_open_local(self, remote):
+        p = self.od_local(remote)
+        if od_on_disk(p):
+            os.startfile(p)
+            return "ok"
+        return "missing"
+
+    def od_reveal_local(self, remote):
+        p = self.od_local(remote)
+        if p.exists():
+            subprocess.Popen(["explorer", "/select,", str(p)])
+        else:
+            subprocess.Popen(["explorer", str(p.parent if p.parent.exists()
+                                                else self.od_dest())])
+        return "ok"
 
     def cancel(self):
         if self.proc and self.proc.poll() is None:
@@ -2632,33 +3129,6 @@ svg{flex:none;}
 ::-webkit-scrollbar-thumb{background:#2A2A38;border-radius:6px;border:3px solid transparent;background-clip:content-box;}
 ::-webkit-scrollbar-thumb:hover{background:#3A3A4C;background-clip:content-box;}
 ::-webkit-scrollbar-track{background:transparent;}
-/* ================= OneDrive section ================= */
-#odtab{margin-bottom:12px;}
-#odview{display:none;flex:1;min-height:0;flex-direction:column;}
-body.cloud #odview{display:flex;}
-body.cloud #grid,body.cloud .libhead{display:none;}
-body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
-#odgrid{padding-bottom:96px;}
-.odnav{display:flex;align-items:center;gap:12px;padding:12px 22px 8px;flex:none;min-width:0;}
-#odcrumb{flex:1;min-width:0;display:flex;align-items:center;gap:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.subcount{font-size:12px;color:var(--dim);white-space:nowrap;flex:none;margin-left:auto;}
-#q,#odq{width:180px;height:34px;border:1px solid var(--line2);border-radius:99px;background:var(--s1);
-  color:var(--tx);padding:0 12px 0 32px;font:12.5px/1 inherit;transition:border-color .18s var(--ease);}
-#q:focus,#odq:focus{outline:none;border-color:var(--ac);}
-#q::placeholder,#odq::placeholder{color:var(--dim);}
-.odsub{display:flex;align-items:center;gap:10px;padding:0 22px 14px;flex:none;flex-wrap:wrap;}
-.destpill{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 14px;border-radius:99px;
-  border:1px solid var(--line2);background:var(--s1);color:var(--mut);font:600 11.5px/1 inherit;
-  cursor:pointer;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  transition:border-color .18s var(--ease),color .18s var(--ease),background .18s var(--ease);}
-.destpill:hover{border-color:var(--ac);color:var(--tx);background:var(--s2);}
-.hactx{height:32px;padding:0 14px;border-radius:99px;border:1px solid var(--line2);
-  background:var(--s1);color:var(--mut);font:600 11.5px/1 inherit;cursor:pointer;
-  display:inline-flex;align-items:center;gap:7px;transition:background .18s var(--ease),color .18s var(--ease),border-color .18s var(--ease);}
-.hactx:hover{background:var(--s3);color:var(--tx);border-color:var(--line2);}
-.oddot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:none;display:inline-block;margin-right:2px;}
-.oddot.ok{background:var(--ok);box-shadow:0 0 8px rgba(61,220,151,.6);}
-.subdot{color:var(--dim);opacity:.5;font-size:12px;}
 /* ---------- settings modal ---------- */
 #settingsscrim{position:fixed;inset:0;background:rgba(4,4,9,.74);opacity:0;pointer-events:none;
   transition:opacity .2s var(--ease);z-index:21;backdrop-filter:blur(3px);}
@@ -2719,7 +3189,6 @@ body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
     </span>
     <h1>YTGrab</h1><span class="ver">v__APP_VERSION__</span>
   </div>
-
   <div class="navlbl">LIBRARIES</div>
   <nav class="nav" id="tabbar" role="tablist" aria-label="Libraries"></nav>
   <button class="addlib" onclick="addTab()" title="Add a library folder">
@@ -2815,8 +3284,6 @@ body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
       <span id="empty-s">Paste a link above and your videos appear here</span>
     </div>
   </div>
-
-
 </main>
 </div>
 
@@ -3548,6 +4015,7 @@ var ui={
 };
 
 /* ================= OneDrive section ================= */
+var odMode=false,odReady=false,odConnected=false,odPath="",odEntries=[],odJobs={},odTBase="";
 var OD_I={
  folder:P.folder,
  image:'<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-4.5-4.5L7 21"/>',
@@ -3761,6 +4229,27 @@ function odPaintEl(card,e){
     else{badge.textContent=e.size_h;badge.className="gbadge";}
   }
 }
+ui.odjob=function(o){
+  odJobs[o.key]=o;
+  for(var i=0;i<odEntries.length;i++){
+    if(odEntries[i].key===o.key){
+      if(o.ondisk)odEntries[i].ondisk=true;
+      if(o.status)odEntries[i].job=(o.status==="queued"||o.status==="running")?o.status:"";
+      break;
+    }
+  }
+  odPaint(o.key);
+  if(o.status==="done")toast("Saved: "+(o.name||"download"));
+  if(o.status==="error")toast("Failed: "+(o.name||""));
+};
+ui.odthumb=function(key){
+  var card=document.getElementById("odg-"+key);if(!card)return;
+  var th=card.querySelector(".gth");
+  var ph=th.querySelector(".gph");if(ph)ph.style.display="none";
+  if(!th.querySelector(".gimg")){
+    var img=document.createElement("img");
+    img.className="gimg";img.alt="";img.loading="lazy";
+    img.onerror=function(){img.style.display="none";};
     img.src=odTBase+key;
     th.insertBefore(img,th.firstChild);
   }
@@ -3776,6 +4265,12 @@ ui.odstrip=function(a){
   document.getElementById("odbari").style.width=(a.pct||0)+"%";
   document.getElementById("odsmeta").textContent=
     (a.pct||0)+"%"+(a.queued?" · "+a.queued+" queued":"");
+};
+ui.odstate=function(s){
+  var was=odConnected;
+  odConnected=!!s.connected;
+  odConnPaint();
+  if(odMode&&odReady&&odConnected&&!was)odGo(odPath||"");
 };
 function odPickDest(){
   pywebview.api.od_pick_dest().then(function(d){
