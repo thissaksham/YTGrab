@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.2"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1616,11 +1616,79 @@ class Api:
 
     # --- history ---
 
+    def resolve_entry_path(self, e):
+        old_path = Path(e.get("path", ""))
+        if old_path.exists():
+            return str(old_path), True
+        
+        fname = e.get("file") or old_path.name
+        if not fname:
+            return str(old_path), False
+
+        tab_dir = Path(self.tab_folder(e.get("tab") or DOWNLOADS_TAB))
+        base_dir = Path(self.download_dir())
+        old_dir = old_path.parent
+
+        candidates = [
+            tab_dir / fname,
+            tab_dir / "youtube" / fname,
+            tab_dir / "imported" / fname,
+            base_dir / fname,
+            base_dir / "youtube" / fname,
+            base_dir / "imported" / fname,
+            old_dir / "youtube" / fname,
+            old_dir / "imported" / fname,
+        ]
+        for cand in candidates:
+            if cand.exists():
+                e["path"] = str(cand)
+                e["file"] = cand.name
+                return str(cand), True
+
+        for search_root in (tab_dir, old_dir, base_dir):
+            try:
+                if search_root.exists():
+                    found = next((p for p in search_root.rglob(fname) if p.is_file()), None)
+                    if found:
+                        e["path"] = str(found)
+                        e["file"] = found.name
+                        return str(found), True
+            except Exception:
+                pass
+
+        return str(old_path), False
+
     def get_history(self):
-        return [{**e, "thumb": entry_thumb(e),
-                 "rel": rel_dir(e.get("path", ""), self.tab_folder(e.get("tab") or DOWNLOADS_TAB)),
-                 "exists": Path(e.get("path", "")).exists()}
-                for e in self.history]
+        migrated = False
+        res = []
+        for e in self.history:
+            path, ok = self.resolve_entry_path(e)
+            if ok and path != e.get("path"):
+                migrated = True
+            res.append({**e, "thumb": entry_thumb(e),
+                        "rel": rel_dir(e.get("path", ""), self.tab_folder(e.get("tab") or DOWNLOADS_TAB)),
+                        "exists": ok})
+        if migrated:
+            save_history(self.history)
+        return res
+
+    def purge_missing(self):
+        """Remove history entries whose files no longer exist anywhere on disk."""
+        before = len(self.history)
+        valid = []
+        for e in self.history:
+            _, ok = self.resolve_entry_path(e)
+            if ok:
+                valid.append(e)
+        self.history = valid
+        save_history(self.history)
+        self._push(f"[history] removed {before - len(self.history)} missing entry(ies)")
+        if UI_WIN:
+            try:
+                UI_WIN.evaluate_js("refreshView()")
+            except Exception:
+                pass
+        return len(self.history)
 
     def get_pending(self):
         """Failed/unfinished downloads from a previous run, so they can be retried."""
@@ -3172,6 +3240,10 @@ body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
         <option value="size">Size</option>
       </select>
       <button id="sortdir" onclick="flipDir()" aria-label="Toggle sort direction"></button>
+      <button id="purgemissing" class="ib" title="Clean up missing files" aria-label="Clean up missing files" onclick="purgeMissingClick()">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+      </button>
     </div>
   </section>
 
@@ -3649,6 +3721,12 @@ function toggleGroup(on){
 }
 function pickSort(mode){curSort=mode;curDir=NAT[mode]||-1;updDirIcon();sortGrid(mode);saveView();}
 function flipDir(){curDir=-curDir;updDirIcon();sortGrid(curSort);saveView();}
+function purgeMissingClick(){
+  pywebview.api.purge_missing().then(function(c){
+    toast("Cleaned up missing entries");
+    refreshTabs();
+  });
+}
 function pickFilter(f){curFilter=f;syncChips();refreshView();saveView();}
 function pickQuery(v){curQuery=(v||"").trim().toLowerCase();refreshView();}
 
