@@ -22,14 +22,8 @@ browser.
 - **No cookie files** — sign into YouTube once inside the app's own browser;
   cookies stay in the encrypted profile. "Mark as watched" is done through
   YouTube's own history, so downloads themselves stay anonymous.
-- **OneDrive section** — browse your OneDrive in the sidebar and pull files down
-  with rclone's multi-threaded engine, several times faster than the sync client
-  for big files. Photo previews, live per-file throughput, and downloads land in
-  `Downloads\OneDriveFast` — outside the sync client's reach, so they stay real
-  local files. An existing rclone OneDrive sign-in is picked up automatically.
 - **Skip download** — just mark a video watched without downloading it.
-- **Self-managing tools** — yt-dlp updates itself on launch; ffmpeg is bundled;
-  rclone is fetched the first time you open the OneDrive section.
+- **Self-managing tools** — yt-dlp updates itself on launch; ffmpeg is bundled.
 - **Queue** — downloads run one after another; failed items get a retry button.
 
 ## Install
