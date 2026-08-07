@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.5"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.6"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -71,7 +71,7 @@ OD_STAGE_DIR = Path(tempfile.gettempdir()) / "ytgrab-od"
 SYSTEM_RCLONE_CONF = Path(os.environ.get("APPDATA", "")) / "rclone" / "rclone.conf"
 RCLONE_ZIP_URL = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
 OD_REMOTE = "onedrive"
-OD_THUMB_MAX = 6 * 1024 * 1024   # rclone has no thumbnail API: a preview IS the file
+OD_THUMB_MAX = 50 * 1024 * 1024   # rclone has no thumbnail API: a preview IS the file
 OD_DL_WORKERS = 2                # files in parallel; each is already multi-threaded
 NEW_CONSOLE = 0x00000010         # CREATE_NEW_CONSOLE (visible, for the OAuth walkthrough)
 RE_OD_STATS = re.compile(r",\s*(\d+)%,\s*([\d.]+\s*[KMGT]?i?B)/s,\s*ETA\s+(\S+)")
@@ -2111,7 +2111,7 @@ class Api:
         try:
             if kind == "video":
                 sample = dest.with_suffix(".sample")
-                cmd = od_cmd("cat", f"{OD_REMOTE}:{remote}", "--head", "5M")
+                cmd = od_cmd("cat", f"{OD_REMOTE}:{remote}", "--head", str(5 * 1024 * 1024))
                 with open(sample, "wb") as f:
                     subprocess.run([str(c) for c in cmd], stdout=f, stderr=subprocess.DEVNULL,
                                    creationflags=NO_WINDOW, timeout=60)
@@ -2191,10 +2191,7 @@ class Api:
         self._od_job_push(key, status="running", pct=0)
         self._od_strip_push()
         cmd = od_cmd("copyto", f"{OD_REMOTE}:{remote}", str(stage),
-                     "--multi-thread-streams", str(int(self.cfg.get("od_streams") or 8)),
-                     "--multi-thread-cutoff", "10M",
-                     "--buffer-size", "64M",
-                     "--onedrive-chunk-size", "50M",
+                     "--multi-thread-streams", str(int(self.cfg.get("od_streams") or 16)),
                      "--stats", "1s", "--stats-one-line", "--stats-log-level", "NOTICE")
         proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
