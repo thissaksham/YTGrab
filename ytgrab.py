@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.7"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.8"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1174,7 +1174,7 @@ class Api:
                         r = subprocess.run(
                             [ytdlp, "--print", "%(uploader)s", "--no-download",
                              "--no-warnings", "-q", f"https://youtu.be/{vid}"],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW)
                         ch = (r.stdout or "").strip()
                         if ch:
                             e["channel"] = ch
