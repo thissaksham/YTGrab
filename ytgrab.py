@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.14.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -999,6 +999,8 @@ def build_entry(info, target, vid, tab=DOWNLOADS_TAB):
     thumb = (f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
              if len(vid) == 11 else (info.get("thumbnail") or ""))
     size = target.stat().st_size
+    url = info.get("webpage_url", "")
+    src = "yt" if is_youtube(url) or len(vid) == 11 else "web"
     return {
         "id": vid or target.stem,
         "title": info.get("title") or target.stem,
@@ -1007,7 +1009,7 @@ def build_entry(info, target, vid, tab=DOWNLOADS_TAB):
         "format": fmt_label(info, target),
         "size": size, "size_h": human_size(size),
         "thumb": thumb, "path": str(target), "ts": time.time(),
-        "released": epoch_from_info(info) or 0, "tab": tab,
+        "released": epoch_from_info(info) or 0, "tab": tab, "source": src,
     }
 
 
@@ -1091,9 +1093,15 @@ class Api:
         self.active_path = ""                      # sub-folder open in that tab
         self._trash = None                         # last removed library, for undo
         migrated = False
-        for e in self.history:     # entries predating tabs: sort them into one
-            if not e.get("tab"):
-                e["tab"] = "imported" if e.get("source") == "local" else DOWNLOADS_TAB
+        for e in self.history:     # entries predating tabs or miscategorized: sort them into correct tab
+            vid = str(e.get("id") or "")
+            src = e.get("source") or ""
+            if src in ("yt", "web") or len(vid) == 11 or e.get("channel"):
+                if e.get("tab") == "imported":
+                    e["tab"] = DOWNLOADS_TAB
+                    migrated = True
+            elif not e.get("tab"):
+                e["tab"] = "imported" if src == "local" else DOWNLOADS_TAB
                 migrated = True
             # local titles used to be the raw filename; tidy them once
             if e.get("source") == "local" and not e.get("file"):
@@ -1226,9 +1234,42 @@ class Api:
 
     def download_dir(self):
         d = self.cfg.get("download_dir")
-        if d and Path(d).is_dir():
+        if d and Path(d).exists():
             return d
-        return str(Path.home() / "Downloads")
+        default_base = Path.home() / "Downloads" / "YTGrab"
+        default_base.mkdir(parents=True, exist_ok=True)
+        return str(default_base)
+
+    def subfolder_path(self, category):
+        base = Path(self.download_dir())
+        if self.cfg.get("use_subfolders", True):
+            sub = base / category
+            sub.mkdir(parents=True, exist_ok=True)
+            return str(sub)
+        return str(base)
+
+    def get_settings(self):
+        return {
+            "download_dir": self.download_dir(),
+            "use_subfolders": self.cfg.get("use_subfolders", True),
+            "od_streams": self.cfg.get("od_streams", 8),
+            "mark_watched": self.cfg.get("mark_watched", True),
+            "set_timestamp": self.cfg.get("set_timestamp", True)
+        }
+
+    def set_settings(self, download_dir=None, use_subfolders=None, od_streams=None, mark_watched=None, set_timestamp=None):
+        if download_dir is not None and Path(download_dir).exists():
+            self.cfg["download_dir"] = download_dir
+        if use_subfolders is not None:
+            self.cfg["use_subfolders"] = bool(use_subfolders)
+        if od_streams is not None:
+            self.cfg["od_streams"] = int(od_streams)
+        if mark_watched is not None:
+            self.cfg["mark_watched"] = bool(mark_watched)
+        if set_timestamp is not None:
+            self.cfg["set_timestamp"] = bool(set_timestamp)
+        save_config(self.cfg)
+        return self.get_settings()
 
     def get_state(self):
         return {"dir": self.download_dir(), "logged_in": self.logged_in,
@@ -1236,6 +1277,7 @@ class Api:
                 "default_format": DEFAULT_FORMAT, "busy": self.busy,
                 "mark_watched": self.cfg.get("mark_watched", True),
                 "set_timestamp": self.cfg.get("set_timestamp", True),
+                "use_subfolders": self.cfg.get("use_subfolders", True),
                 "views": self.views}
 
     def pick_folder(self):
@@ -1245,12 +1287,20 @@ class Api:
             save_config(self.cfg)
         return self.download_dir()
 
+    def pick_base_dir(self):
+        res = UI_WIN.create_file_dialog(webview.FOLDER_DIALOG, directory=self.download_dir())
+        if res:
+            self.cfg["download_dir"] = res[0]
+            save_config(self.cfg)
+            return res[0]
+        return self.download_dir()
+
     def pick_files(self):
         """Keyboard/menu route to the same thing drag & drop does."""
         fd = getattr(webview, "FileDialog", None)   # OPEN_DIALOG is deprecated in 6.x
         res = UI_WIN.create_file_dialog(
             fd.OPEN if fd else webview.OPEN_DIALOG,
-            allow_multiple=True, directory=self.download_dir(),
+            allow_multiple=True, directory=self.subfolder_path("imported"),
             file_types=("Video files (*.mp4;*.mkv;*.webm;*.mov;*.avi;*.m4v;*.flv)",
                         "All files (*.*)"))
         if res:
@@ -1263,40 +1313,40 @@ class Api:
         return [dict(t, folder=self.tab_folder(t["id"])) for t in self.tabs]
 
     def site_tab(self, url):
-        """(tab_id, folder) a download from this url belongs in. YouTube keeps the
-        main download folder; every other site gets its own library + sub-folder,
-        created on first use."""
+        """(tab_id, folder) a download from this url belongs in."""
         if is_youtube(url):
-            return DOWNLOADS_TAB, Path(self.download_dir())
+            return DOWNLOADS_TAB, Path(self.subfolder_path("youtube"))
         host, _ = site_key(url)
         if not host:
-            return DOWNLOADS_TAB, Path(self.download_dir())
+            return DOWNLOADS_TAB, Path(self.subfolder_path("youtube"))
         tid = "site-" + re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")
         t = next((x for x in self.tabs if x["id"] == tid), None)
+        sname = site_name(host)
         if not t:
-            name = site_name(host)
-            folder = Path(self.download_dir()) / name
-            t = {"id": tid, "name": name, "folder": str(folder), "site": host}
+            folder = Path(self.subfolder_path(sname.lower()))
+            t = {"id": tid, "name": sname, "folder": str(folder), "site": host}
             self.tabs.append(t)
             self.cfg["tabs"] = self.tabs
             save_config(self.cfg)
-            self._push(f"[tab] new library '{name}' for {host}")
+            self._push(f"[tab] new library '{sname}' for {host}")
             if UI_WIN:
                 try:
                     UI_WIN.evaluate_js("refreshTabs()")
                 except Exception:
                     pass
-        folder = Path(t.get("folder") or self.download_dir())
+        folder = Path(t.get("folder") or self.subfolder_path(sname.lower()))
         folder.mkdir(parents=True, exist_ok=True)
         return t["id"], folder
 
     def tab_folder(self, tid):
-        """Folder a tab points at. Blank/built-in falls back to the download dir."""
+        """Folder a tab points at. Blank/built-in falls back to subfolder."""
+        if tid == "imported":
+            return self.subfolder_path("imported")
         if tid and tid != DOWNLOADS_TAB:
             t = next((x for x in self.tabs if x["id"] == tid), None)
             if t and t.get("folder"):
                 return t["folder"]
-        return self.download_dir()
+        return self.subfolder_path("youtube")
 
     def set_tab(self, tid):
         """JS tells us which tab is showing, so a drop lands in the right folder."""
@@ -1808,9 +1858,9 @@ class Api:
 
     def od_dest(self):
         d = self.cfg.get("od_dest")
-        if d and Path(d).is_dir():
+        if d and Path(d).exists():
             return d
-        return str(Path.home() / "Downloads" / "OneDriveFast")
+        return self.subfolder_path("onedrive")
 
     def od_local(self, remote):
         return Path(self.od_dest()) / Path(*remote.split("/"))
@@ -1986,6 +2036,9 @@ class Api:
         self._od_strip_push()
         cmd = od_cmd("copyto", f"{OD_REMOTE}:{remote}", str(stage),
                      "--multi-thread-streams", str(int(self.cfg.get("od_streams") or 8)),
+                     "--multi-thread-cutoff", "10M",
+                     "--buffer-size", "64M",
+                     "--onedrive-chunk-size", "64M",
                      "--stats", "1s", "--stats-one-line", "--stats-log-level", "NOTICE")
         proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -2927,13 +2980,36 @@ body.cloud #odview{display:flex;}
 body.cloud #grid,body.cloud .libhead{display:none;}
 body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
 #odgrid{padding-bottom:96px;}
-.odnav{display:flex;align-items:center;gap:9px;padding:4px 22px 10px;flex:none;}
-.odsub{display:flex;align-items:center;gap:9px;padding:0 22px 12px;flex:none;}
-.destpill{border:none;font:inherit;cursor:pointer;transition:border-color .18s var(--ease);}
-.destpill:hover{border-color:var(--ac);}
-.destpill:hover span{color:var(--tx);}
-.oddot{width:7px;height:7px;border-radius:50%;background:var(--warn);flex:none;}
-.oddot.ok{background:var(--ok);box-shadow:0 0 7px rgba(61,220,151,.6);}
+.odnav{display:flex;align-items:center;gap:12px;padding:12px 22px 8px;flex:none;min-width:0;}
+#odcrumb{flex:1;min-width:0;display:flex;align-items:center;gap:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.subcount{font-size:12px;color:var(--dim);white-space:nowrap;flex:none;margin-left:auto;}
+#q,#odq{width:180px;height:34px;border:1px solid var(--line2);border-radius:99px;background:var(--s1);
+  color:var(--tx);padding:0 12px 0 32px;font:12.5px/1 inherit;transition:border-color .18s var(--ease);}
+#q:focus,#odq:focus{outline:none;border-color:var(--ac);}
+#q::placeholder,#odq::placeholder{color:var(--dim);}
+.odsub{display:flex;align-items:center;gap:10px;padding:0 22px 14px;flex:none;flex-wrap:wrap;}
+.destpill{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 14px;border-radius:99px;
+  border:1px solid var(--line2);background:var(--s1);color:var(--mut);font:600 11.5px/1 inherit;
+  cursor:pointer;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  transition:border-color .18s var(--ease),color .18s var(--ease),background .18s var(--ease);}
+.destpill:hover{border-color:var(--ac);color:var(--tx);background:var(--s2);}
+.hactx{height:32px;padding:0 14px;border-radius:99px;border:1px solid var(--line2);
+  background:var(--s1);color:var(--mut);font:600 11.5px/1 inherit;cursor:pointer;
+  display:inline-flex;align-items:center;gap:7px;transition:background .18s var(--ease),color .18s var(--ease),border-color .18s var(--ease);}
+.hactx:hover{background:var(--s3);color:var(--tx);border-color:var(--line2);}
+.oddot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex:none;display:inline-block;margin-right:2px;}
+.oddot.ok{background:var(--ok);box-shadow:0 0 8px rgba(61,220,151,.6);}
+.subdot{color:var(--dim);opacity:.5;font-size:12px;}
+/* ---------- settings modal ---------- */
+#settingsscrim{position:fixed;inset:0;background:rgba(4,4,9,.74);opacity:0;pointer-events:none;
+  transition:opacity .2s var(--ease);z-index:21;backdrop-filter:blur(3px);}
+#settingsscrim.open{opacity:1;pointer-events:auto;}
+#settingsdialog{position:fixed;left:50%;top:50%;transform:translate(-50%,-48%) scale(.98);opacity:0;
+  pointer-events:none;width:min(520px,94vw);max-height:86vh;overflow-y:auto;background:var(--s2);
+  border:1px solid var(--line2);border-radius:var(--r-xl);padding:22px;z-index:22;
+  display:flex;flex-direction:column;gap:18px;
+  transition:opacity .2s var(--ease),transform .2s var(--ease);box-shadow:0 30px 76px rgba(0,0,0,.66);}
+#settingsdialog.open{opacity:1;pointer-events:auto;transform:translate(-50%,-50%) scale(1);}
 .dlbtn{margin-left:auto;display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 10px;
   border:none;border-radius:99px;background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff;
   cursor:pointer;font:650 11px/1 inherit;flex:none;transition:filter .15s var(--ease);}
@@ -3025,6 +3101,10 @@ body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
         stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
       <span class="ibadge" id="conbadge"></span>
+    </button>
+    <button class="ib" id="settingsbtn" onclick="openSettings()" title="Settings — download folders & options" aria-label="Settings">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
     <button class="ib" id="loginbtn" title="Profile — signed-in sites and dependencies"
             aria-label="Profile" onclick="openProf()">
@@ -3199,6 +3279,46 @@ body.cloud .urlwrap,body.cloud #dl,body.cloud #importbtn{display:none;}
       <span id="ssmeta" class="msub"></span><span class="sp"></span>
       <button class="tbtn" onclick="loadSites(true)">Refresh list</button>
     </div>
+  </div>
+</div>
+
+<div id="settingsscrim" onclick="closeSettings()"></div>
+<div id="settingsdialog" role="dialog" aria-modal="true" aria-labelledby="stitle">
+  <div class="phead">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    <h3 id="stitle">Settings</h3><span class="sp"></span>
+    <button class="cx" onclick="closeSettings()" aria-label="Close">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
+  </div>
+  <div class="field">
+    <span class="slabel">DEFAULT DOWNLOAD LOCATION</span>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <input type="text" id="set-folder" readonly style="flex:1;height:38px;border:1px solid var(--line2);border-radius:var(--r-md);background:var(--s1);color:var(--tx);padding:0 13px;font:12.5px/1 inherit;">
+      <button class="backb" onclick="pickSettingsFolder()">Browse…</button>
+    </div>
+  </div>
+  <div class="field">
+    <span class="slabel">AUTOMATIC SUBFOLDERS</span>
+    <label class="ck" style="background:var(--s1);border:1px solid var(--line2);border-radius:var(--r-md);padding:12px;">
+      <input type="checkbox" id="set-subfolders" checked>
+      <div>
+        <div style="font-weight:600;color:var(--tx);">Create dedicated category subfolders</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px;">Organizes downloads into youtube/, hotstar/, imported/, and onedrive/</div>
+      </div>
+    </label>
+  </div>
+  <div class="field">
+    <span class="slabel">ONEDRIVE PARALLEL STREAMS</span>
+    <select id="set-streams" style="height:38px;border:1px solid var(--line2);border-radius:var(--r-md);background:var(--s1);color:var(--tx);padding:0 13px;font:12.5px/1 inherit;">
+      <option value="4">4 streams</option>
+      <option value="8" selected>8 streams (Recommended for high speed)</option>
+      <option value="16">16 streams (Maximum speed)</option>
+    </select>
+  </div>
+  <div class="sact" style="margin-top:8px;justify-content:flex-end;">
+    <button class="tbtn" onclick="closeSettings()">Cancel</button>
+    <button class="tbtn solid" onclick="saveSettingsModal()">Save Settings</button>
   </div>
 </div>
 
@@ -4224,6 +4344,36 @@ function confirmDl(){
     .then(function(r){if(r==="no-deps")ui.log("[!] dependencies missing");});
 }
 function pickDir(){pywebview.api.pick_folder().then(function(d){dlFolder=d;renderSub();});}
+
+/* ================= settings ================= */
+function openSettings(){
+  pywebview.api.get_settings().then(function(s){
+    document.getElementById("set-folder").value = s.download_dir || "";
+    document.getElementById("set-subfolders").checked = s.use_subfolders !== false;
+    document.getElementById("set-streams").value = s.od_streams || 8;
+    document.getElementById("settingsscrim").classList.add("open");
+    document.getElementById("settingsdialog").classList.add("open");
+  });
+}
+function closeSettings(){
+  document.getElementById("settingsscrim").classList.remove("open");
+  document.getElementById("settingsdialog").classList.remove("open");
+}
+function pickSettingsFolder(){
+  pywebview.api.pick_base_dir().then(function(d){
+    if(d) document.getElementById("set-folder").value = d;
+  });
+}
+function saveSettingsModal(){
+  var d = document.getElementById("set-folder").value;
+  var sub = document.getElementById("set-subfolders").checked;
+  var st = parseInt(document.getElementById("set-streams").value, 10);
+  pywebview.api.set_settings(d, sub, st).then(function(s){
+    closeSettings();
+    toast("Settings saved");
+    refreshTabs();
+  });
+}
 
 /* ================= profile ================= */
 function openProf(){
