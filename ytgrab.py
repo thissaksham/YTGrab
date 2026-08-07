@@ -16,6 +16,7 @@ Build: pyinstaller --onefile --windowed --name YTGrab --icon ytgrab.ico ytgrab.p
 """
 import base64
 import ctypes
+import configparser
 import hashlib
 import json
 import os
@@ -41,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.6"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.7"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -71,7 +72,6 @@ OD_STAGE_DIR = Path(tempfile.gettempdir()) / "ytgrab-od"
 SYSTEM_RCLONE_CONF = Path(os.environ.get("APPDATA", "")) / "rclone" / "rclone.conf"
 RCLONE_ZIP_URL = "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
 OD_REMOTE = "onedrive"
-OD_THUMB_MAX = 50 * 1024 * 1024   # rclone has no thumbnail API: a preview IS the file
 OD_DL_WORKERS = 2                # files in parallel; each is already multi-threaded
 NEW_CONSOLE = 0x00000010         # CREATE_NEW_CONSOLE (visible, for the OAuth walkthrough)
 RE_OD_STATS = re.compile(r",\s*(\d+)%,\s*([\d.]+\s*[KMGT]?i?B)/s,\s*ETA\s+(\S+)")
@@ -1162,7 +1162,7 @@ class Api:
                       if e.get("source") == "yt" and not e.get("channel")]
         if missing_ch:
             def _backfill_channels(entries, hist_ref):
-                ytdlp = str(BIN / "yt-dlp.exe")
+                ytdlp = str(BIN_DIR / "yt-dlp.exe")
                 RE = re.compile(r"\[([a-zA-Z0-9_-]{11})\]")
                 changed = False
                 for idx, e in entries:
@@ -2094,34 +2094,35 @@ class Api:
                  "size": size, "size_h": human_size(size), "kind": kind,
                  "ondisk": False if is_dir else od_on_disk(self.od_local(remote)),
                  "job": job["status"] if job and job["status"] in ("queued", "running") else ""}
-            if kind in ("image", "video") and 0 < size:
-                if kind == "image" and size > OD_THUMB_MAX:
-                    pass
-                elif key in od["thumb_done"]:
+            # Graph API supports thumbnails for almost everything (images, videos, PDFs, docs, etc)
+            if not is_dir:
+                if key in od["thumb_done"]:
                     e["thumb"] = key
-                else:
-                    od["thumbs"].submit(self._od_fetch_thumb, remote, key, kind)
+                elif it.get("ID"):
+                    od["thumbs"].submit(self._od_fetch_thumb, it.get("ID"), key)
             entries.append(e)
         entries.sort(key=lambda e: (not e["isdir"], e["name"].lower()))
         return {"ok": True, "path": path, "entries": entries}
 
-    def _od_fetch_thumb(self, remote, key, kind="image"):
+    def _od_fetch_thumb(self, item_id, key):
         dest = OD_THUMB_DIR / key
         tmp = dest.with_suffix(".part")
         try:
-            if kind == "video":
-                sample = dest.with_suffix(".sample")
-                cmd = od_cmd("cat", f"{OD_REMOTE}:{remote}", "--head", str(5 * 1024 * 1024))
-                with open(sample, "wb") as f:
-                    subprocess.run([str(c) for c in cmd], stdout=f, stderr=subprocess.DEVNULL,
-                                   creationflags=NO_WINDOW, timeout=60)
-                if sample.exists() and sample.stat().st_size > 0:
-                    make_thumb(sample, tmp, 0)
-                sample.unlink(missing_ok=True)
-            else:
-                r = subprocess.run(od_cmd("copyto", f"{OD_REMOTE}:{remote}", str(tmp),
-                                          "--ignore-times"),
-                                   capture_output=True, creationflags=NO_WINDOW, timeout=120)
+            # 1. Parse token from rclone.conf
+            config = configparser.ConfigParser()
+            config.read(SYSTEM_RCLONE_CONF)
+            token = json.loads(config[OD_REMOTE]["token"])
+            acc = token["access_token"]
+            drive_id = config[OD_REMOTE]["drive_id"]
+            
+            # 2. Get thumbnail URL from Graph API
+            url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/thumbnails/0/large/content"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {acc}"})
+            
+            # 3. Download the thumbnail
+            with urllib.request.urlopen(req, timeout=10) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            
             if tmp.exists() and tmp.stat().st_size > 0:
                 tmp.replace(dest)
                 self._od["thumb_done"].add(key)
@@ -2130,9 +2131,9 @@ class Api:
                         UI_WIN.evaluate_js(f"ui.odthumb({json.dumps(key)})")
                     except Exception:
                         pass
-            else:
-                tmp.unlink(missing_ok=True)
         except Exception:
+            pass
+        finally:
             tmp.unlink(missing_ok=True)
 
     def od_download(self, remote, name):
