@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.12"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.16.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -63,6 +63,8 @@ FFMPEG = BIN_DIR / "ffmpeg.exe"
 FFPROBE = BIN_DIR / "ffprobe.exe"
 FF_VER_FILE = BIN_DIR / "ffmpeg.ver"
 NODE = BIN_DIR / "node.exe"  # JS runtime yt-dlp uses to solve YouTube's sig/n challenge
+QJS = BIN_DIR / "qjs.exe"
+QJS_URL = "https://github.com/quickjs-ng/quickjs/releases/latest/download/qjs-windows-x86_64.exe"  # ~2 MB, vs node's ~85 MB
 
 # OneDrive section (rclone-backed fast browser)
 RCLONE = BIN_DIR / "rclone.exe"
@@ -647,12 +649,15 @@ def ensure_deps(push, force_ffmpeg=False):
         push(f"[deps] yt-dlp setup failed: {e}")
 
     try:
-        if not NODE.exists():
-            push("[deps] downloading node.exe (solves YouTube's JS challenge)... (~85 MB)")
-            download_file(NODE_URL, NODE, push, "node")
-            push("[deps] node ready")
+        if not QJS.exists():
+            push("[deps] downloading qjs.exe (solves YouTube's JS challenge)... (~2 MB)")
+            download_file(QJS_URL, QJS, push, "quickjs")
+            push("[deps] quickjs ready")
     except Exception as e:
-        push(f"[deps] node setup failed (YouTube may hit bot-checks): {e}")
+        push(f"[deps] quickjs setup failed (YouTube may hit bot-checks): {e}")
+    # node.exe is no longer auto-fetched -- quickjs covers the same role at a
+    # fraction of the size. Existing installs that already have node.exe keep
+    # using it as a fallback (see yt_args()); nothing deletes it.
 
     have_ff = FFMPEG.exists() and FFPROBE.exists()
     if have_ff and not force_ffmpeg:
@@ -1068,10 +1073,14 @@ def yt_args(url):
     it to 0 via SABR, so we stay anonymous), plus a bundled JS runtime so yt-dlp
     can solve YouTube's signature/n challenge. Without the runtime those fail,
     downloads throttle, and YouTube bot-checks the session after a few videos.
-    Deno (yt-dlp's default) proved flaky here; node solved it reliably."""
+    QuickJS is primary (~2 MB, officially supported by yt-dlp); node.exe
+    (~85 MB) is kept only as a fallback for installs that had it before this
+    change -- it's no longer fetched automatically."""
     if is_youtube(url):
         a = ["--extractor-args", "youtube:player_client=default,web_safari"]
-        if NODE.exists():
+        if QJS.exists():
+            a += ["--no-js-runtimes", "--js-runtimes", f"quickjs:{QJS}"]
+        elif NODE.exists():
             a += ["--no-js-runtimes", "--js-runtimes", f"node:{NODE}"]
         return a
     return []
@@ -1925,8 +1934,9 @@ class Api:
         def dep(p, label):
             return {"name": label, "ok": p.exists(),
                     "where": str(p) if p.exists() else "not installed"}
-        deps = [dep(YTDLP, "yt-dlp"), dep(FFMPEG, "ffmpeg"),
-                dep(FFPROBE, "ffprobe"), dep(NODE, "node (YouTube JS challenge)")]
+        deps = [dep(YTDLP, "yt-dlp"), dep(FFMPEG, "ffmpeg"), dep(FFPROBE, "ffprobe"),
+                dep(QJS, "quickjs (YouTube JS challenge)"),
+                dep(NODE, "node (fallback runtime, if already installed)")]
         return {"sites": sites, "deps": deps, "bin": short_path(BIN_DIR)}
 
     def get_supported(self, refresh=False):
@@ -2673,29 +2683,38 @@ class Api:
         self._shred(tmp)
 
         if code != 0 and botcheck:
-            if is_youtube(url) and self.logged_in:
-                self._push("[*] bot-check tripped: falling back to session cookies...")
-                auth2, tmp2 = self._session_args("https://www.youtube.com/", "youtube")
-                cmd2 = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
-                       *yt_args(url)]
-                if items:
-                    cmd2 += ["--playlist-items", items]
-                if is_playlist(url):
-                    cmd2 += ["--ignore-errors"]
-                cmd2 += auth2
-                cmd2.append(url)
-                code, botcheck = self._run_ytdlp(cmd2, dl_dir, parse)
-                self._shred(tmp2)
-
-            if code != 0 and botcheck:
-                if not NODE.exists():
-                    self._push("[!] YouTube bot-check: the JS-challenge runtime (node) isn't "
-                               "installed yet. Let the deps download finish (see log above), "
-                               "then hit Retry.")
+            if not (QJS.exists() or NODE.exists()):
+                self._push("[!] YouTube bot-check: the JS-challenge runtime isn't "
+                           "installed yet. Let the deps download finish (see log above), "
+                           "then hit Retry.")
+            elif is_youtube(url) and self.logged_in:
+                # Anonymous request got bot-checked (usually mid-batch, after burning
+                # through the anonymous budget). Retry once with the profile's YouTube
+                # session cookies -- accepts a possibly reduced/SABR format list for
+                # this one video in exchange for actually completing it.
+                self._push("[!] YouTube bot-check - retrying this video with your "
+                           "signed-in profile session...")
+                sess_auth, sess_tmp = self._session_args(
+                    "https://www.youtube.com/", "youtube")
+                if sess_auth:
+                    cmd2 = cmd[:-1] + sess_auth + [url]  # swap auth, same target url
+                    parse2, state2 = self._make_parser()
+                    code, botcheck = self._run_ytdlp(cmd2, dl_dir, parse2)
+                    self._shred(sess_tmp)
+                    state = state2
+                    if code == 0:
+                        self._push("[+] succeeded with signed-in session "
+                                   "(format list may be reduced for this video)")
+                    else:
+                        self._push("[!] still bot-checked even with cookies - "
+                                   "wait a bit and hit Retry.")
                 else:
-                    self._push("[!] YouTube bot-check. The JS challenge failed this time - "
-                               "hit Retry; if it persists, wait a minute (YouTube rate-limits "
-                               "bursts) and retry.")
+                    self._push("[!] couldn't read a YouTube session from the profile - "
+                               "make sure you're logged in (Profile panel), then Retry.")
+            else:
+                self._push("[!] YouTube bot-check. The JS challenge failed this time - "
+                           "hit Retry; if it persists, wait a minute (YouTube rate-limits "
+                           "bursts) and retry.")
 
         for k in state["items"]:
             self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))
