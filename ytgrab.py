@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.11"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.15.12"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -2673,14 +2673,29 @@ class Api:
         self._shred(tmp)
 
         if code != 0 and botcheck:
-            if not NODE.exists():
-                self._push("[!] YouTube bot-check: the JS-challenge runtime (node) isn't "
-                           "installed yet. Let the deps download finish (see log above), "
-                           "then hit Retry.")
-            else:
-                self._push("[!] YouTube bot-check. The JS challenge failed this time - "
-                           "hit Retry; if it persists, wait a minute (YouTube rate-limits "
-                           "bursts) and retry.")
+            if is_youtube(url) and self.logged_in:
+                self._push("[*] bot-check tripped: falling back to session cookies...")
+                auth2, tmp2 = self._session_args("https://www.youtube.com/", "youtube")
+                cmd2 = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
+                       *yt_args(url)]
+                if items:
+                    cmd2 += ["--playlist-items", items]
+                if is_playlist(url):
+                    cmd2 += ["--ignore-errors"]
+                cmd2 += auth2
+                cmd2.append(url)
+                code, botcheck = self._run_ytdlp(cmd2, dl_dir, parse)
+                self._shred(tmp2)
+
+            if code != 0 and botcheck:
+                if not NODE.exists():
+                    self._push("[!] YouTube bot-check: the JS-challenge runtime (node) isn't "
+                               "installed yet. Let the deps download finish (see log above), "
+                               "then hit Retry.")
+                else:
+                    self._push("[!] YouTube bot-check. The JS challenge failed this time - "
+                               "hit Retry; if it persists, wait a minute (YouTube rate-limits "
+                               "bursts) and retry.")
 
         for k in state["items"]:
             self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))
