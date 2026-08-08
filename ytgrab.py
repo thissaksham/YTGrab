@@ -2850,7 +2850,7 @@ svg{flex:none;}
   transition:background .18s var(--ease),color .18s var(--ease);}
 .hact:hover{background:var(--s3);color:var(--tx);}
 .hact.danger:hover{color:var(--danger);}
-.tools{display:flex;align-items:center;gap:7px;}
+.tools{display:flex;align-items:center;gap:7px;margin-left:auto;}
 .chips{display:flex;gap:3px;background:var(--s1);border:1px solid var(--line);
   border-radius:var(--r-sm);padding:3px;}
 .chipb{display:inline-flex;align-items:center;gap:6px;height:27px;padding:0 11px;border:none;
@@ -3225,10 +3225,6 @@ svg{flex:none;}
         stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-5-6-5"/><path d="M12 19h8"/></svg>
       <span class="ibadge" id="conbadge"></span>
     </button>
-    <button class="ib" id="settingsbtn" onclick="openSettings()" title="Settings — download folders & options" aria-label="Settings">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-    </button>
     <button class="ib" id="loginbtn" title="Profile — signed-in sites and dependencies"
             aria-label="Profile" onclick="openProf()">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -3245,7 +3241,6 @@ svg{flex:none;}
       </div>
       <div id="libsub"></div>
     </div>
-    <span class="sp"></span>
     <div class="tools">
       <div class="chips" id="filtertabs" role="tablist" aria-label="Filter by state">
         <button class="chipb on" role="tab" aria-selected="true" data-f="all" onclick="pickFilter('all')">All <span class="cnt" id="c-all">0</span></button>
@@ -3333,6 +3328,23 @@ svg{flex:none;}
   </div>
   <div class="ppane" id="mainpane">
     <div class="field">
+      <span class="slabel">DEFAULT DOWNLOAD LOCATION</span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="text" id="set-folder" readonly style="flex:1;height:38px;border:1px solid var(--line2);border-radius:var(--r-md);background:var(--s1);color:var(--tx);padding:0 13px;font:12.5px/1 inherit;">
+        <button class="backb" onclick="pickSettingsFolder()">Browse…</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="slabel">AUTOMATIC SUBFOLDERS</span>
+      <label class="ck" style="background:var(--s1);border:1px solid var(--line2);border-radius:var(--r-md);padding:12px;">
+        <input type="checkbox" id="set-subfolders" onchange="saveFolderSettings()">
+        <div>
+          <div style="font-weight:600;color:var(--tx);">Create dedicated category subfolders</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:2px;">Organizes downloads into youtube/, hotstar/, imported/, etc.</div>
+        </div>
+      </label>
+    </div>
+    <div class="field">
       <span class="slabel">SIGNED-IN SITES</span>
       <div id="sitelist" class="sitelist"></div>
       <div class="addsite">
@@ -3369,46 +3381,6 @@ svg{flex:none;}
       <span id="ssmeta" class="msub"></span><span class="sp"></span>
       <button class="tbtn" onclick="loadSites(true)">Refresh list</button>
     </div>
-  </div>
-</div>
-
-<div id="settingsscrim" onclick="closeSettings()"></div>
-<div id="settingsdialog" role="dialog" aria-modal="true" aria-labelledby="stitle">
-  <div class="phead">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-    <h3 id="stitle">Settings</h3><span class="sp"></span>
-    <button class="cx" onclick="closeSettings()" aria-label="Close">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-    </button>
-  </div>
-  <div class="field">
-    <span class="slabel">DEFAULT DOWNLOAD LOCATION</span>
-    <div style="display:flex;gap:8px;align-items:center;">
-      <input type="text" id="set-folder" readonly style="flex:1;height:38px;border:1px solid var(--line2);border-radius:var(--r-md);background:var(--s1);color:var(--tx);padding:0 13px;font:12.5px/1 inherit;">
-      <button class="backb" onclick="pickSettingsFolder()">Browse…</button>
-    </div>
-  </div>
-  <div class="field">
-    <span class="slabel">AUTOMATIC SUBFOLDERS</span>
-    <label class="ck" style="background:var(--s1);border:1px solid var(--line2);border-radius:var(--r-md);padding:12px;">
-      <input type="checkbox" id="set-subfolders" checked>
-      <div>
-        <div style="font-weight:600;color:var(--tx);">Create dedicated category subfolders</div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px;">Organizes downloads into youtube/, hotstar/, imported/, and onedrive/</div>
-      </div>
-    </label>
-  </div>
-  <div class="field">
-    <span class="slabel">ONEDRIVE PARALLEL STREAMS</span>
-    <select id="set-streams" style="height:38px;border:1px solid var(--line2);border-radius:var(--r-md);background:var(--s1);color:var(--tx);padding:0 13px;font:12.5px/1 inherit;">
-      <option value="4">4 streams</option>
-      <option value="8" selected>8 streams (Recommended for high speed)</option>
-      <option value="16">16 streams (Maximum speed)</option>
-    </select>
-  </div>
-  <div class="sact" style="margin-top:8px;justify-content:flex-end;">
-    <button class="tbtn" onclick="closeSettings()">Cancel</button>
-    <button class="tbtn solid" onclick="saveSettingsModal()">Save Settings</button>
   </div>
 </div>
 
@@ -3685,7 +3657,7 @@ function loadView(tid){
   curFilter=v.filter||"all";
   groupOn=!!v.group;
   document.getElementById("ck-group").checked=groupOn;
-  document.getElementById("grouptoggle").classList.toggle("on",tabById(tid).builtin);
+  document.getElementById("grouptoggle").classList.toggle("on",tid==="downloads");
   curQuery="";
   document.getElementById("q").value="";
   document.getElementById("sortsel").value=curSort;
@@ -4442,40 +4414,31 @@ function confirmDl(){
 function pickDir(){pywebview.api.pick_folder().then(function(d){dlFolder=d;renderSub();});}
 
 /* ================= settings ================= */
-function openSettings(){
-  pywebview.api.get_settings().then(function(s){
-    document.getElementById("set-folder").value = s.download_dir || "";
-    document.getElementById("set-subfolders").checked = s.use_subfolders !== false;
-    document.getElementById("set-streams").value = s.od_streams || 8;
-    document.getElementById("settingsscrim").classList.add("open");
-    document.getElementById("settingsdialog").classList.add("open");
-  });
-}
-function closeSettings(){
-  document.getElementById("settingsscrim").classList.remove("open");
-  document.getElementById("settingsdialog").classList.remove("open");
-}
 function pickSettingsFolder(){
   pywebview.api.pick_base_dir().then(function(d){
-    if(d) document.getElementById("set-folder").value = d;
+    if(d) {
+      document.getElementById("set-folder").value = d;
+      saveFolderSettings();
+    }
   });
 }
-function saveSettingsModal(){
+function saveFolderSettings(){
   var d = document.getElementById("set-folder").value;
   var sub = document.getElementById("set-subfolders").checked;
-  var st = parseInt(document.getElementById("set-streams").value, 10);
-  pywebview.api.set_settings(d, sub, st).then(function(s){
-    closeSettings();
-    toast("Settings saved");
+  pywebview.api.set_settings(d, sub).then(function(s){
     refreshTabs();
   });
 }
 
 /* ================= profile ================= */
 function openProf(){
-  document.getElementById("profscrim").classList.add("open");
-  document.getElementById("prof").classList.add("open");
-  loadProfile();
+  pywebview.api.get_settings().then(function(s){
+    document.getElementById("set-folder").value = s.download_dir || "";
+    document.getElementById("set-subfolders").checked = s.use_subfolders !== false;
+    document.getElementById("profscrim").classList.add("open");
+    document.getElementById("prof").classList.add("open");
+    loadProfile();
+  });
 }
 function closeProf(){
   document.getElementById("profscrim").classList.remove("open");
