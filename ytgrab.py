@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.15.12"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.16.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1013,9 +1013,11 @@ def build_entry(info, target, vid, tab=DOWNLOADS_TAB):
     }
 
 
-def postprocess(dl_dir, started, api, mark=True, stamp=True, tab=DOWNLOADS_TAB):
+def postprocess(dl_dir, started, api, mark=True, stamp=True, tab=DOWNLOADS_TAB,
+                success=True):
     """For each fresh .info.json: optionally stamp the file date and mark it
     watched (with live phase updates), record a history entry, delete the json.
+    Mark-watched only runs when the download succeeded and a video file exists.
     Returns the list of history entries built."""
     push = api._push
     entries = []
@@ -1035,7 +1037,7 @@ def postprocess(dl_dir, started, api, mark=True, stamp=True, tab=DOWNLOADS_TAB):
                     set_file_times(target, epoch)
                     push(f"[post] timestamp set: {target.name}")
             url = info.get("webpage_url", "")
-            if mark and "youtube" in url and api.logged_in:
+            if mark and target and success and "youtube" in url and api.logged_in:
                 api._item(key=vid, status="processing", phase="Marking watched")
                 browser_mark_watched(url, push)
             if target:
@@ -2699,7 +2701,8 @@ class Api:
 
         for k in state["items"]:
             self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))
-        entries = postprocess(dl_dir, started, self, mark, stamp, dest_tab)
+        entries = postprocess(dl_dir, started, self, mark, stamp, dest_tab,
+                              success=(code == 0))
         done_ids = set()
         for e in entries:
             self._add_history(e)
