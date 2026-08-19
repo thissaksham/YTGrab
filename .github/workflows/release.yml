@@ -1,0 +1,146 @@
+# Builds YTGrab (onedir PyInstaller build -> Inno Setup installer) entirely on
+# GitHub's servers and attaches the finished YTGrab-Setup-X.X.X.exe to a GitHub
+# Release. Nothing needs to be installed locally to produce a build.
+#
+# HOW TO CUT A RELEASE:
+#   Just edit installer.iss and bump #define AppVersion. Commit and push to main.
+#   This workflow will:
+#     1. Sync that same version into ytgrab.py (APP_VERSION)
+#     2. Create a matching tag (e.g. v1.17.1)
+#     3. Build the installer
+#     4. Publish a GitHub Release
+#
+# You can also still trigger manually from the Actions tab, or by pushing a v* tag.
+
+name: Build and Release
+
+permissions:
+  contents: write  # required to create commits, tags, releases, and upload the installer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "installer.iss"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync app version from installer.iss
+        if: github.ref_type != 'tag'
+        id: sync_version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path installer.iss -Pattern '#define\s+AppVersion\s+"([^"]+)"'
+          if (-not $m) { throw "Could not parse AppVersion from installer.iss" }
+          $ver = $m.Matches.Groups[1].Value
+
+          $content = Get-Content ytgrab.py -Raw
+          $newContent = $content -replace 'APP_VERSION = "[^"]+"', "APP_VERSION = `"$ver`""
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if ($content -ne $newContent) {
+            Set-Content -Path ytgrab.py -Value $newContent -NoNewline
+            git add ytgrab.py
+            git commit -m "Sync APP_VERSION to $ver [skip ci]"
+            git push
+            Write-Host "Updated ytgrab.py to $ver"
+          } else {
+            Write-Host "ytgrab.py already at $ver"
+          }
+
+          $sha = git rev-parse HEAD
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine release tag
+        id: rel
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $ver = $tag -replace '^v',''
+            $sha = "${{ github.sha }}"
+            Write-Host "Triggered by tag $tag"
+          } else {
+            $m = Select-String -Path installer.iss -Pattern '#define\s+AppVersion\s+"([^"]+)"'
+            $ver = $m.Matches.Groups[1].Value
+            $tag = "v$ver"
+            $sha = "${{ steps.sync_version.outputs.sha }}"
+            Write-Host "Parsed version $ver from installer.iss"
+
+            $headers = @{
+              Authorization = "Bearer $env:GITHUB_TOKEN"
+              Accept = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+            }
+            $ref = "refs/tags/$tag"
+            $encodedRef = [System.Uri]::EscapeDataString($ref)
+            try {
+              Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/git/refs/$encodedRef" -Headers $headers -Method Get | Out-Null
+              Write-Host "Tag $tag already exists"
+            } catch {
+              $body = @{ref = $ref; sha = $sha} | ConvertTo-Json
+              Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/git/refs" -Headers $headers -Method Post -Body $body | Out-Null
+              Write-Host "Created tag $tag"
+            }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyinstaller pywebview
+
+      - name: Build onedir PyInstaller app
+        run: |
+          pyinstaller --onedir --windowed --name YTGrab --icon ytgrab.ico ytgrab.py
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y
+
+      - name: Compile installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Find the built installer
+        id: find_installer
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem -Path dist -Filter "YTGrab-Setup-*.exe" | Select-Object -First 1
+          if (-not $file) {
+            Write-Error "No YTGrab-Setup-*.exe found in dist\ -- check the build steps above for errors."
+            exit 1
+          }
+          "installer_path=$($file.FullName)" >> $env:GITHUB_OUTPUT
+          "installer_name=$($file.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          files: ${{ steps.find_installer.outputs.installer_path }}
+          name: ${{ steps.rel.outputs.tag }}
+          generate_release_notes: true
