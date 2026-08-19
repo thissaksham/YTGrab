@@ -1,12 +1,11 @@
 """YTGrab — single-exe yt-dlp UI for Windows.
 
 WebView2 (ships with Windows 11) renders the UI and hosts the captive
-login. YouTube downloads run ANONYMOUS on purpose: passing the account
-session makes YouTube serve SABR-only streams that yield 0 downloadable
-formats (verified), while anonymous gives the full format list. Login is
-used for mark-watched (browser stat pings, no cookies to yt-dlp) and for
-non-YouTube sites, whose session is handed to yt-dlp via a temp file that
-is zeroed and deleted the moment the run ends.
+login. YouTube downloads use the signed-in profile cookies and the bundled
+JS runtime: this avoids the 403/bot-check errors anonymous downloads hit
+on many networks/accounts. Login is also used for mark-watched (browser
+stat pings), and the session is handed to yt-dlp via a temp file that is
+zeroed and deleted the moment the run ends.
 All app data lives in %LOCALAPPDATA%\\YTGrab\\ (bin, profile, config, history).
 
   ytgrab.py            launch the UI
@@ -42,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.16.2"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.16.3"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -691,7 +690,7 @@ def ensure_deps(push, force_ffmpeg=False):
             push("[deps] ffmpeg ready")
     except Exception as e:
         push(f"[deps] ffmpeg setup failed: {e}")
-    return YTDLP.exists() and FFMPEG.exists() and FFPROBE.exists()
+    return YTDLP.exists() and FFMPEG.exists() and FFPROBE.exists() and NODE.exists()
 
 
 # === OneDrive section: rclone-backed fast browser ===
@@ -1066,16 +1065,14 @@ def youtube_id(url):
 
 
 def yt_args(url):
-    """Player clients that keep the full format list (session cookies would drop
-    it to 0 via SABR, so we stay anonymous), plus a bundled JS runtime so yt-dlp
-    can solve YouTube's signature/n challenge. Without the runtime those fail,
-    downloads throttle, and YouTube bot-checks the session after a few videos.
-    Deno (yt-dlp's default) proved flaky here; node solved it reliably."""
+    """YouTube player clients plus the bundled JS runtime so yt-dlp can solve
+    signature/n challenges reliably. Cookies are passed separately; using the
+    signed-in session avoids the 403/bot-checks anonymous downloads hit on
+    many networks/accounts. Deno (yt-dlp's default) proved flaky here; node
+    solved it reliably."""
     if is_youtube(url):
-        a = ["--extractor-args", "youtube:player_client=default,web_safari"]
-        if NODE.exists():
-            a += ["--no-js-runtimes", "--js-runtimes", f"node:{NODE}"]
-        return a
+        return ["--extractor-args", "youtube:player_client=default,web_safari",
+                "--no-js-runtimes", "--js-runtimes", f"node:{NODE}"]
     return []
 
 
@@ -1256,7 +1253,7 @@ class Api:
 
     def _set_state(self, **extra):
         state = {"dir": self.download_dir(), "logged_in": self.logged_in,
-                 "deps_ok": YTDLP.exists() and FFMPEG.exists(), "busy": self.busy}
+                 "deps_ok": YTDLP.exists() and FFMPEG.exists() and NODE.exists(), "busy": self.busy}
         state.update(extra)
         if UI_WIN:
             try:
@@ -1286,15 +1283,15 @@ class Api:
 
     def _auth_for(self, url):
         """Auth for a url -> (args, tmp). tmp may be None.
-        YouTube stays ANONYMOUS: the account session makes YT serve SABR-only
-        streams (0 downloadable formats). Non-YouTube sites use their session;
-        sonyliv/hotstar use their saved credential files."""
+        YouTube uses the signed-in profile cookies to avoid 403/bot-checks.
+        Non-YouTube sites use their session; sonyliv/hotstar use their saved
+        credential files."""
         da = domain_auth(url)
         if da:
             return da, None
-        if is_youtube(url):
-            return [], None
         host, key = site_key(url)
+        if is_youtube(url):
+            host, key = "www.youtube.com", "youtube"
         if host:
             return self._session_args(f"https://{host}/", key)
         return [], None
@@ -1351,7 +1348,7 @@ class Api:
 
     def get_state(self):
         return {"dir": self.download_dir(), "logged_in": self.logged_in,
-                "deps_ok": YTDLP.exists() and FFMPEG.exists(),
+                "deps_ok": YTDLP.exists() and FFMPEG.exists() and NODE.exists(),
                 "default_format": DEFAULT_FORMAT, "busy": self.busy,
                 "mark_watched": self.cfg.get("mark_watched", True),
                 "set_timestamp": self.cfg.get("set_timestamp", True),
@@ -2414,7 +2411,7 @@ class Api:
         url = (url or "").strip().strip('"')
         if not url:
             return "no-url"
-        if not (YTDLP.exists() and FFMPEG.exists()):
+        if not (YTDLP.exists() and FFMPEG.exists() and NODE.exists()):
             return "no-deps"
         fmt = custom_fmt.strip() if (fmt_mode == "custom" and custom_fmt.strip()) else DEFAULT_FORMAT
         self.cfg["mark_watched"] = bool(mark_watched)
@@ -2677,30 +2674,9 @@ class Api:
         code, botcheck = self._run_ytdlp(cmd, dl_dir, parse)
         self._shred(tmp)
 
-        if code != 0 and botcheck:
-            if is_youtube(url) and self.logged_in:
-                self._push("[*] bot-check tripped: falling back to session cookies...")
-                auth2, tmp2 = self._session_args("https://www.youtube.com/", "youtube")
-                cmd2 = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
-                       *yt_args(url)]
-                if items:
-                    cmd2 += ["--playlist-items", items]
-                if is_playlist(url):
-                    cmd2 += ["--ignore-errors"]
-                cmd2 += auth2
-                cmd2.append(url)
-                code, botcheck = self._run_ytdlp(cmd2, dl_dir, parse)
-                self._shred(tmp2)
-
-            if code != 0 and botcheck:
-                if not NODE.exists():
-                    self._push("[!] YouTube bot-check: the JS-challenge runtime (node) isn't "
-                               "installed yet. Let the deps download finish (see log above), "
-                               "then hit Retry.")
-                else:
-                    self._push("[!] YouTube bot-check. The JS challenge failed this time - "
-                               "hit Retry; if it persists, wait a minute (YouTube rate-limits "
-                               "bursts) and retry.")
+        if code != 0 and botcheck and is_youtube(url):
+            self._push("[!] YouTube bot-check. Hit Retry; if it persists, wait a minute "
+                       "(YouTube rate-limits bursts) and retry.")
 
         for k in state["items"]:
             self._jobs.setdefault(k, (url, fmt, items, mark, stamp, False))
