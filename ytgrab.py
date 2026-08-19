@@ -42,7 +42,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.16.1"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.16.2"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -2307,6 +2307,9 @@ class Api:
         job = self._jobs.get(key)
         if not job:
             return "unknown"
+        if not self._worker_up:
+            self._worker_up = True
+            threading.Thread(target=self._queue_loop, daemon=True).start()
         self._item(key=key, status="queued")
         self._q.put((*job, key, False))
         return "queued"
