@@ -82,10 +82,12 @@ FF_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FF_VER_URLS = ["https://www.gyan.dev/ffmpeg/builds/release-version",
                "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.ver"]
 
-DEFAULT_FORMAT = ("bv*[vcodec~=vp9][height>=720][height<=1080]+ba[acodec~=opus]"
-                  "/bv*[height>=720][height<=1080]+ba[acodec~=opus]"
-                  "/bv*[vcodec~=vp9][height>1080]+ba[acodec~=opus]"
-                  "/bv+ba/best")
+DEFAULT_FORMAT = ("bv*[vcodec~=vp9][height=1080][fps=60][protocol!^=m3u8]+ba[acodec~=opus][protocol!^=m3u8]"
+                  "/bv*[vcodec~=vp9][height=1080][protocol!^=m3u8]+ba[acodec~=opus][protocol!^=m3u8]"
+                  "/bv*[vcodec~=vp9][height>=720][height<=1080][protocol!^=m3u8]+ba[acodec~=opus][protocol!^=m3u8]"
+                  "/bv*[height>=720][height<=1080][protocol!^=m3u8]+ba[acodec~=opus][protocol!^=m3u8]"
+                  "/bv*[vcodec~=vp9][height>1080][protocol!^=m3u8]+ba[acodec~=opus][protocol!^=m3u8]"
+                  "/bv*[protocol!^=m3u8]+ba/b[protocol!^=m3u8]")
 BASE_OPTS = ["--no-warnings", "--embed-metadata", "--embed-thumbnail",
              "--convert-thumbnails", "jpg", "--write-info-json", "--retries", "3",
              "--progress", "--newline", "--merge-output-format", "mp4"]
@@ -4323,20 +4325,21 @@ function autoFmt(){
   var q=document.getElementById("vqual").value;
   if(q==="lowest")return "wv*+ba/w";
   var hc=q==="best"?"":"[height<="+q+"]";
-  var fb=q==="best"?"bv*+ba/b":"bv*[height<="+q+"]+ba/b[height<="+q+"]";
-  if(curVfmt==="legacy")return "bv*"+hc+"[vcodec^=avc]+ba/"+fb;
-  var cs=["[vcodec~='^vp0?9']","[vcodec~='^av01']","[vcodec~='^(hev1|hvc1)']"];
+  var proto="[protocol!^=m3u8]";
+  var fb=q==="best"?"bv*"+proto+"+ba/b"+proto:"bv*"+hc+proto+"+ba/b"+hc+proto;
+  if(curVfmt==="legacy")return "bv*"+hc+"[vcodec^=avc]"+proto+"+ba/"+fb;
+  var cs=["[vcodec~='^vp0?9']"+proto,"[vcodec~='^av01']"+proto,"[vcodec~='^(hev1|hvc1)']"+proto];
   return cs.map(function(c){return "bv*"+hc+c+"+ba";}).join("/")+"/"+fb;
 }
 function genericV(){return [
-  {label:"1080p",sub:"",size:"",fmt:"bv*[height<=1080]+ba/b[height<=1080]"},
-  {label:"720p",sub:"",size:"",fmt:"bv*[height<=720]+ba/b[height<=720]"},
-  {label:"480p",sub:"",size:"",fmt:"bv*[height<=480]+ba/b[height<=480]"},
-  {label:"360p",sub:"",size:"",fmt:"bv*[height<=360]+ba/b[height<=360]"}
+  {label:"1080p",sub:"",size:"",fmt:"bv*[height<=1080][protocol!^=m3u8]+ba/b[height<=1080][protocol!^=m3u8]"},
+  {label:"720p",sub:"",size:"",fmt:"bv*[height<=720][protocol!^=m3u8]+ba/b[height<=720][protocol!^=m3u8]"},
+  {label:"480p",sub:"",size:"",fmt:"bv*[height<=480][protocol!^=m3u8]+ba/b[height<=480][protocol!^=m3u8]"},
+  {label:"360p",sub:"",size:"",fmt:"bv*[height<=360][protocol!^=m3u8]+ba/b[height<=360][protocol!^=m3u8]"}
 ];}
 function renderVList(vformats){
   var list=(vformats&&vformats.length)?vformats.slice():genericV();
-  list.unshift({label:"Best available",sub:"Best video + best audio",size:"",fmt:"bv*+ba/b"});
+  list.unshift({label:"Best available",sub:"Best video + best audio",size:"",fmt:"bv*[protocol!^=m3u8]+ba/b[protocol!^=m3u8]"});
   var ql=document.getElementById("vlist");ql.innerHTML="";
   list.forEach(function(o,i){
     var b=document.createElement("button");
