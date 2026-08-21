@@ -41,7 +41,7 @@ from pathlib import Path
 import webview
 
 APP_NAME = "YTGrab"
-APP_VERSION = "1.16.4"  # keep in sync with installer.iss AppVersion (drives the update-check)
+APP_VERSION = "1.17.0"  # keep in sync with installer.iss AppVersion (drives the update-check)
 
 
 # All app data (deps, browser profile, config, history) lives here for BOTH
@@ -1075,6 +1075,28 @@ def yt_args(url):
     if is_youtube(url):
         return ["--extractor-args", "youtube:player_client=default,web_safari",
                 "--no-js-runtimes", "--js-runtimes", f"node:{NODE}"]
+    return []
+
+
+def sub_args(url):
+    """English subtitle args for a URL: prefer creator-uploaded subs, fall
+    back to auto-generated captions. Returns [] when neither is available."""
+    try:
+        r = subprocess.run([str(YTDLP), "--no-warnings", "-J", "--skip-download",
+                            "--socket-timeout", "10", *yt_args(url), url],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", creationflags=NO_WINDOW, timeout=30)
+        d = json.loads(r.stdout) if (r.stdout or "").strip() else {}
+    except Exception:
+        return []
+    if not isinstance(d, dict):
+        return []
+    subs = d.get("subtitles") or {}
+    auto = d.get("automatic_captions") or {}
+    if subs.get("en"):
+        return ["--write-subs", "--embed-subs", "--sub-langs", "en"]
+    if auto.get("en"):
+        return ["--write-auto-subs", "--embed-subs", "--sub-langs", "en"]
     return []
 
 
@@ -2595,6 +2617,8 @@ class Api:
                 phase = "Embedding thumbnail"
             elif line.startswith("[ExtractAudio]"):
                 phase = "Extracting audio"
+            elif line.startswith("[EmbedSubtitle]"):
+                phase = "Embedding subtitles"
             elif line.startswith("[Fixup"):
                 phase = "Finalizing"
             if phase:
@@ -2662,8 +2686,12 @@ class Api:
         started = time.time()
         dest_tab, dest_dir = self.site_tab(url)   # non-YouTube sites get their own library
         dl_dir = str(dest_dir)
+        sub = sub_args(url)
+        if sub:
+            self._push("[*] " + ("auto-generated " if "--write-auto-subs" in sub else "") +
+                       "English subtitles will be embedded")
         cmd = [YTDLP, "-f", fmt, *BASE_OPTS, "--ffmpeg-location", str(BIN_DIR),
-               *yt_args(url)]
+               *yt_args(url), *sub]
         if items:
             cmd += ["--playlist-items", items]
         if is_playlist(url):
